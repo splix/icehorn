@@ -10,6 +10,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 
 use crate::cli::CopyArgs;
 use crate::config::S3Config;
+use crate::sync_log;
 
 pub async fn run(args: CopyArgs) -> Result<()> {
     let src_config = S3Config::from_file(&args.from_config)?;
@@ -43,6 +44,25 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         .context("failed to list destination objects")?;
     tracing::info!("destination has {} existing files", existing.len());
 
+    // Load sync logs so we can skip rewritten metadata that hasn't changed at source
+    let prev_sync = match sync_log::load_all(&*dst_store, &dst_prefix).await {
+        Ok(log) => log,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load sync logs, proceeding without");
+            HashMap::new()
+        }
+    };
+    let prev_sync = Arc::new(prev_sync);
+
+    let shutdown = shutdown::Shutdown::new().context("registering shutdown signals")?;
+
+    // Start the sync log writer — entries flow to it via a channel, and it
+    // commits to S3 on Close or on shutdown (independently).
+    let (sync_tx, sync_writer) = sync_log::start_writer(
+        Arc::clone(&dst_store) as Arc<dyn ObjectStore>,
+        dst_prefix.clone(),
+    );
+
     let existing = Arc::new(existing);
     let copied = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
@@ -53,15 +73,17 @@ pub async fn run(args: CopyArgs) -> Result<()> {
     let src_prefix_obj = ObjPath::from(src_prefix.as_str());
     let parallelism = args.copy_parallel;
 
-    src_store
+    let copy_all = src_store
         .list(Some(&src_prefix_obj))
         .map(|r| r.context("failed to list source objects"))
         .try_for_each_concurrent(parallelism, |obj| {
             let src_store = Arc::clone(&src_store);
             let dst_store = Arc::clone(&dst_store);
             let existing = Arc::clone(&existing);
+            let prev_sync = Arc::clone(&prev_sync);
             let copied = Arc::clone(&copied);
             let skipped = Arc::clone(&skipped);
+            let sync_tx = sync_tx.clone();
             let from_url = Arc::clone(&from_url);
             let to_url = Arc::clone(&to_url);
             let dst_prefix = Arc::clone(&dst_prefix);
@@ -77,7 +99,9 @@ pub async fn run(args: CopyArgs) -> Result<()> {
                     .trim_start_matches('/');
                 let dst_path = ObjPath::from(format!("{dst_prefix}/{relative}"));
 
-                // Skip files that already exist at the destination with the same size
+                let file_type = classify(src_path.as_ref());
+
+                // Skip verbatim files that already exist with the same size
                 if let Some(&dst_size) = existing.get(relative) {
                     if dst_size == obj.size {
                         skipped.fetch_add(1, Ordering::Relaxed);
@@ -85,7 +109,17 @@ pub async fn run(args: CopyArgs) -> Result<()> {
                     }
                 }
 
-                let file_type = classify(src_path.as_ref());
+                // Skip rewritten metadata if the source hasn't changed (sync log)
+                // and the destination file still exists
+                if file_type.is_rewritten() && existing.contains_key(relative) {
+                    if let Some(entry) = prev_sync.get(relative) {
+                        if entry.matches_source(obj.size, obj.e_tag.as_deref()) {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                    }
+                }
+
                 tracing::debug!(?file_type, src = %src_path, dst = %dst_path, "copying");
 
                 let result = match file_type {
@@ -109,6 +143,13 @@ pub async fn run(args: CopyArgs) -> Result<()> {
                 match result {
                     Ok(()) => {
                         copied.fetch_add(1, Ordering::Relaxed);
+                        let _ = sync_tx.send(sync_log::Msg::Entry(sync_log::Entry {
+                            relative_path: relative.to_string(),
+                            source_size: obj.size as i64,
+                            source_etag: obj.e_tag.clone(),
+                            file_type: file_type.as_str().to_string(),
+                            rewritten: file_type.is_rewritten(),
+                        })).await;
                     }
                     Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|oe| matches!(oe, object_store::Error::NotFound { .. })) => {
                         tracing::warn!(src = %src_path, "source file disappeared during copy, skipping");
@@ -121,12 +162,33 @@ pub async fn run(args: CopyArgs) -> Result<()> {
                 }
                 Ok(())
             }
-        })
-        .await?;
+        });
+
+    // Race the copy against a shutdown signal so we still save progress on Ctrl+C.
+    // The sync log writer monitors shutdown independently and will commit on its own.
+    let copy_error = tokio::select! {
+        result = copy_all => result.err(),
+        _ = shutdown.signalled() => {
+            tracing::info!("interrupted — waiting for sync log to flush");
+            None
+        }
+    };
+
+    // On normal completion, tell the writer to commit. On error, drop
+    // the sender without Close so the writer abandons the file.
+    if copy_error.is_none() {
+        let _ = sync_tx.send(sync_log::Msg::Close).await;
+    }
+    drop(sync_tx);
+    sync_writer.join().await?;
 
     let copied = copied.load(Ordering::Relaxed);
     let skipped = skipped.load(Ordering::Relaxed);
     tracing::info!("done — {copied} copied, {skipped} skipped");
+
+    if let Some(e) = copy_error {
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -149,12 +211,27 @@ fn parse_s3_url(url: &str) -> Result<(String, String)> {
 // File-type classification
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum FileType {
     Parquet,
     Json,
     Avro,
     Other,
+}
+
+impl FileType {
+    fn as_str(self) -> &'static str {
+        match self {
+            FileType::Parquet => "parquet",
+            FileType::Json => "json",
+            FileType::Avro => "avro",
+            FileType::Other => "other",
+        }
+    }
+
+    fn is_rewritten(self) -> bool {
+        matches!(self, FileType::Json | FileType::Avro)
+    }
 }
 
 fn classify(path: &str) -> FileType {

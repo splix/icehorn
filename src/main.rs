@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod copy;
+mod sync_log;
 
 use anyhow::Result;
 use clap::Parser;
