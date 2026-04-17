@@ -10,17 +10,20 @@ use object_store::{ObjectStore, ObjectStoreExt};
 
 use crate::cli::CopyArgs;
 use crate::config::S3Config;
+use crate::s3_url::S3Location;
 use crate::sync_log;
 
 pub async fn run(args: CopyArgs) -> Result<()> {
     let src_config = S3Config::from_file(&args.from_config)?;
     let dst_config = S3Config::from_file(&args.to_config)?;
 
-    let (src_bucket, src_prefix) = parse_s3_url(&args.from)?;
-    let (dst_bucket, dst_prefix) = parse_s3_url(&args.to)?;
+    let src = S3Location::parse(&args.from)?;
+    let dst = S3Location::parse(&args.to)?;
+    let src_prefix = src.prefix;
+    let dst_prefix = dst.prefix;
 
-    let src_store = Arc::new(src_config.build_store(&src_bucket)?);
-    let dst_store = Arc::new(dst_config.build_store(&dst_bucket)?);
+    let src_store = Arc::new(src_config.build_store(&src.bucket)?);
+    let dst_store = Arc::new(dst_config.build_store(&dst.bucket)?);
 
     // Pre-scan destination: collect relative_path → size for all existing objects
     tracing::info!("scanning destination for existing files…");
@@ -190,21 +193,6 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         return Err(e);
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// S3 URL helpers
-// ---------------------------------------------------------------------------
-
-fn parse_s3_url(url: &str) -> Result<(String, String)> {
-    let rest = url
-        .strip_prefix("s3://")
-        .or_else(|| url.strip_prefix("s3a://"))
-        .with_context(|| format!("URL must start with s3:// or s3a://: {url}"))?;
-    let (bucket, path) = rest
-        .split_once('/')
-        .with_context(|| format!("URL must contain a path after bucket: {url}"))?;
-    Ok((bucket.to_string(), path.trim_end_matches('/').to_string()))
 }
 
 // ---------------------------------------------------------------------------

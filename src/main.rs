@@ -1,6 +1,8 @@
 mod cli;
 mod config;
 mod copy;
+mod s3_url;
+mod show;
 mod sync_log;
 
 use anyhow::Result;
@@ -18,6 +20,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Copy(args) => copy::run(args).await?,
+        Command::Show { command } => show::run(command).await?,
     }
 
     Ok(())
