@@ -46,11 +46,16 @@ pub struct CopyArgs {
 #[derive(Subcommand)]
 pub enum ShowCommand {
     /// Print the current metadata version and filename UUID
-    Version(ShowVersionArgs),
+    Version(TableArgs),
+
+    /// Print the current snapshot and a few preceding snapshots
+    Snapshot(TableArgs),
 }
 
+/// Parameters that identify a single Iceberg table on S3. Shared by every
+/// `show <subcommand>` so each one stays consistent on the command line.
 #[derive(clap::Args)]
-pub struct ShowVersionArgs {
+pub struct TableArgs {
     /// Path to s3cmd config file
     #[arg(long)]
     pub config: PathBuf,
