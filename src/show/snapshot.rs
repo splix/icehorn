@@ -6,11 +6,11 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use object_store::path::Path as ObjPath;
-use serde::Deserialize;
 
-use super::metadata::{find_latest, read_json};
 use crate::cli::TableArgs;
 use crate::config::S3Config;
+use crate::iceberg::metadata::{find_latest, read_json};
+use crate::iceberg::model::{Metadata, Snapshot};
 use crate::s3_url::S3Location;
 
 /// How deep we walk the `parent-snapshot-id` chain beyond the current
@@ -47,24 +47,19 @@ pub async fn run(args: TableArgs) -> Result<()> {
         .map(|s| (s.snapshot_id, s))
         .collect();
 
-    // A freshly created table has no current snapshot — Iceberg encodes that
-    // either by omitting `current-snapshot-id` or setting it to `-1`.
-    let current_id = match meta.current_snapshot_id {
-        None | Some(-1) => {
-            println!();
-            println!("No current snapshot (empty table).");
-            return Ok(());
-        }
-        Some(id) => id,
+    let Some(current) = meta.current_snapshot() else {
+        println!();
+        println!("No current snapshot (empty table).");
+        return Ok(());
     };
 
     println!();
     println!("Current snapshot:");
-    print_snapshot(&by_id, current_id, "  ");
+    print_snapshot(&by_id, current.snapshot_id, "  ");
 
     println!();
     println!("Previous snapshots:");
-    let mut parent = by_id.get(&current_id).and_then(|s| s.parent_snapshot_id);
+    let mut parent = current.parent_snapshot_id;
     let mut shown = 0;
     while let Some(id) = parent {
         if shown >= PREVIOUS_SNAPSHOTS_TO_SHOW {
@@ -113,75 +108,9 @@ fn format_timestamp(ms: i64) -> String {
         .unwrap_or_else(|_| format!("{ms} ms since epoch"))
 }
 
-// ---------------------------------------------------------------------------
-// metadata.json — minimal subset we actually use.
-//
-// The schema is large and evolves between format versions, so we only
-// deserialize the fields needed here. Unknown keys are ignored by serde.
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct Metadata {
-    #[serde(rename = "format-version")]
-    format_version: u32,
-    #[serde(rename = "table-uuid")]
-    table_uuid: Option<String>,
-    #[serde(rename = "current-snapshot-id")]
-    current_snapshot_id: Option<i64>,
-    #[serde(default)]
-    snapshots: Vec<Snapshot>,
-}
-
-#[derive(Deserialize)]
-struct Snapshot {
-    #[serde(rename = "snapshot-id")]
-    snapshot_id: i64,
-    #[serde(rename = "parent-snapshot-id", default)]
-    parent_snapshot_id: Option<i64>,
-    #[serde(rename = "timestamp-ms")]
-    timestamp_ms: i64,
-    #[serde(default)]
-    summary: HashMap<String, String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn deserializes_representative_metadata() {
-        // Trimmed real-world metadata.json with two snapshots.
-        let raw = r#"{
-            "format-version": 2,
-            "table-uuid": "019d9daf-e720-7131-ba9a-b771f5c2b2f1",
-            "location": "s3://bucket/tbl",
-            "last-updated-ms": 1700000050000,
-            "last-column-id": 3,
-            "current-snapshot-id": 1000000000000000002,
-            "snapshots": [
-                {
-                    "snapshot-id": 1000000000000000001,
-                    "timestamp-ms": 1700000000000,
-                    "summary": { "operation": "append", "added-records": "100" },
-                    "manifest-list": "s3://bucket/tbl/metadata/snap-1.avro"
-                },
-                {
-                    "snapshot-id": 1000000000000000002,
-                    "parent-snapshot-id": 1000000000000000001,
-                    "timestamp-ms": 1700000050000,
-                    "summary": { "operation": "append", "added-records": "250" },
-                    "manifest-list": "s3://bucket/tbl/metadata/snap-2.avro"
-                }
-            ]
-        }"#;
-
-        let meta: Metadata = serde_json::from_str(raw).unwrap();
-        assert_eq!(meta.format_version, 2);
-        assert_eq!(meta.current_snapshot_id, Some(1000000000000000002));
-        assert_eq!(meta.snapshots.len(), 2);
-        assert_eq!(meta.snapshots[1].parent_snapshot_id, Some(1000000000000000001));
-        assert_eq!(meta.snapshots[0].summary.get("operation").unwrap(), "append");
-    }
 
     #[test]
     fn format_timestamp_is_iso8601_in_utc() {

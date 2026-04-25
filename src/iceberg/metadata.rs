@@ -61,7 +61,7 @@ impl MetadataFile {
 }
 
 pub async fn find_latest(
-    store: &impl ObjectStore,
+    store: &(impl ObjectStore + ?Sized),
     prefix: &ObjPath,
 ) -> Result<Option<MetadataFile>> {
     let mut stream = store.list(Some(prefix));
@@ -87,10 +87,10 @@ pub async fn find_latest(
             break;
         }
 
-        if let Some(candidate) = MetadataFile::parse(&obj.location) {
-            if latest.as_ref().is_none_or(|b| candidate.version > b.version) {
-                latest = Some(candidate);
-            }
+        if let Some(candidate) = MetadataFile::parse(&obj.location)
+            && latest.as_ref().is_none_or(|b| candidate.version > b.version)
+        {
+            latest = Some(candidate);
         }
     }
     Ok(latest)
@@ -103,7 +103,7 @@ pub async fn find_latest(
 /// in practice some engines emit gzipped content with a plain
 /// `.metadata.json` extension (or put the `.gz` marker in the middle of the
 /// name), and we've hit table layouts that break filename-based detection.
-pub async fn read_json(store: &impl ObjectStore, path: &ObjPath) -> Result<Vec<u8>> {
+pub async fn read_json(store: &(impl ObjectStore + ?Sized), path: &ObjPath) -> Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 

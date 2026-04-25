@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod copy;
+mod iceberg;
 mod s3_url;
 mod show;
 mod sync_log;
@@ -15,6 +16,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+
+    tracing::info!("INFO log enabled");
+    tracing::debug!("DEBUG log enabled");
+    tracing::trace!("TRACE log enabled");
 
     let cli = Cli::parse();
 

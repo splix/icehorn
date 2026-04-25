@@ -3,7 +3,6 @@
 //! Each subcommand lives in its own submodule so adding a new inspector
 //! (schema, partitions, manifest-list, …) stays a single-file change.
 
-mod metadata;
 mod snapshot;
 mod version;
 

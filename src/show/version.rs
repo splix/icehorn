@@ -3,9 +3,9 @@
 use anyhow::{Context, Result};
 use object_store::path::Path as ObjPath;
 
-use super::metadata::find_latest;
 use crate::cli::TableArgs;
 use crate::config::S3Config;
+use crate::iceberg::metadata::find_latest;
 use crate::s3_url::S3Location;
 
 pub async fn run(args: TableArgs) -> Result<()> {
