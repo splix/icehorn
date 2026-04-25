@@ -28,14 +28,17 @@ pub async fn run(args: TableArgs) -> Result<()> {
         .await?
         .context("no <NNNNN>-<uuid>.metadata.json files found under metadata/")?;
 
+    println!("Metadata file    : {}", latest.path.filename().unwrap_or("n/a"));
+    println!("Metadata version : {}", latest.version);
+    println!("Metadata id      : {}", latest.uuid);
+
     let bytes = read_json(&store, &latest.path).await?;
     let meta: Metadata =
         serde_json::from_slice(&bytes).context("failed to parse metadata JSON")?;
 
-    println!("Metadata version: {}", latest.version);
-    println!("Format version: {}", meta.format_version);
+    println!("Format version   : {}", meta.format_version);
     if let Some(uuid) = &meta.table_uuid {
-        println!("Table UUID: {uuid}");
+        println!("Table UUID       : {uuid}");
     }
 
     let by_id: HashMap<i64, &Snapshot> = meta
@@ -87,15 +90,15 @@ fn print_snapshot(by_id: &HashMap<i64, &Snapshot>, id: i64, indent: &str) {
         return;
     };
 
-    println!("{indent}ID: {}", snap.snapshot_id);
-    println!("{indent}Timestamp: {}", format_timestamp(snap.timestamp_ms));
+    println!("{indent}ID                : {}", snap.snapshot_id);
+    println!("{indent}Timestamp         : {}", format_timestamp(snap.timestamp_ms));
     if let Some(op) = snap.summary.get("operation") {
-        println!("{indent}Operation: {op}");
+        println!("{indent}Operation         : {op}");
     }
     for (label, key) in [
-        ("Added records", "added-records"),
-        ("Deleted records", "deleted-records"),
-        ("Added data files", "added-data-files"),
+        ("Added records     ", "added-records"),
+        ("Deleted records   ", "deleted-records"),
+        ("Added data files  ", "added-data-files"),
         ("Deleted data files", "deleted-data-files"),
     ] {
         if let Some(value) = snap.summary.get(key) {
