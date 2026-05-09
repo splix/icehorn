@@ -3,6 +3,7 @@
 //! Each subcommand lives in its own submodule so adding a new inspector
 //! (schema, partitions, manifest-list, …) stays a single-file change.
 
+mod schema;
 mod snapshot;
 mod version;
 
@@ -14,5 +15,6 @@ pub async fn run(cmd: ShowCommand) -> Result<()> {
     match cmd {
         ShowCommand::Version(args) => version::run(args).await,
         ShowCommand::Snapshot(args) => snapshot::run(args).await,
+        ShowCommand::Schema(args) => schema::run(args).await,
     }
 }

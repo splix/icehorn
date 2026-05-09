@@ -90,6 +90,9 @@ pub enum ShowCommand {
 
     /// Print the current snapshot and a few preceding snapshots
     Snapshot(TableArgs),
+
+    /// Print the columns of the current schema as a table
+    Schema(TableArgs),
 }
 
 /// Parameters that identify a single Iceberg table on S3. Shared by every
