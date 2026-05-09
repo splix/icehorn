@@ -5,6 +5,7 @@
 
 mod schema;
 mod snapshot;
+mod tables;
 mod version;
 
 use anyhow::Result;
@@ -16,5 +17,6 @@ pub async fn run(cmd: ShowCommand) -> Result<()> {
         ShowCommand::Version(args) => version::run(args).await,
         ShowCommand::Snapshot(args) => snapshot::run(args).await,
         ShowCommand::Schema(args) => schema::run(args).await,
+        ShowCommand::Tables(args) => tables::run(args).await,
     }
 }

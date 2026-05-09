@@ -93,6 +93,11 @@ pub enum ShowCommand {
 
     /// Print the columns of the current schema as a table
     Schema(TableArgs),
+
+    /// List the Iceberg tables under a given S3 location. The location
+    /// may point at a single table, a namespace, or the root that holds
+    /// multiple namespaces — the level is auto-detected.
+    Tables(LocationArgs),
 }
 
 /// Parameters that identify a single Iceberg table on S3. Shared by every
@@ -104,6 +109,23 @@ pub struct TableArgs {
     pub config: PathBuf,
 
     /// S3 URL of the Iceberg table (e.g. s3://bucket/path/to/table)
+    #[arg(long)]
+    pub location: String,
+}
+
+/// Parameters for commands whose `--location` can point at any level of
+/// an Iceberg layout (table, namespace, or root). Kept separate from
+/// `TableArgs` so the `--location` help text stays accurate for each.
+#[derive(clap::Args)]
+pub struct LocationArgs {
+    /// Path to s3cmd config file
+    #[arg(long)]
+    pub config: PathBuf,
+
+    /// S3 URL to inspect. May point at a table
+    /// (`s3://bucket/<prefix>/<ns>/<table>`), a namespace
+    /// (`s3://bucket/<prefix>/<ns>`), or a root holding namespaces
+    /// (`s3://bucket/<prefix>`). The level is detected automatically.
     #[arg(long)]
     pub location: String,
 }
