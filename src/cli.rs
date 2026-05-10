@@ -4,6 +4,12 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "icehorn", about = "Iceberg data lake utilities")]
 pub struct Cli {
+    /// Disable the interactive TUI and print plain text output. Useful
+    /// when running under CI or when the output is being piped — anywhere
+    /// a live terminal can't be assumed.
+    #[arg(long, global = true)]
+    pub plain: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -55,8 +61,11 @@ pub struct CopyArgs {
     #[arg(long = "copy.parallel", default_value_t = 32)]
     pub copy_parallel: usize,
 
-    /// Tables copied concurrently when the namespace contains more than
-    /// one (default: 4). Files within each table use `--copy.parallel`.
+    /// Maximum tables in the file-copy phase at once (default: 4).
+    /// Discovery (manifest walk + destination scan) runs in parallel
+    /// for every table regardless, so a small table can finish its
+    /// scan and start copying while large tables are still scanning.
+    /// Files within each table use `--copy.parallel`.
     #[arg(long = "tables.parallel", default_value_t = 4)]
     pub tables_parallel: usize,
 }

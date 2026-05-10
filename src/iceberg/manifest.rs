@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use apache_avro::types::Value;
@@ -29,6 +30,20 @@ pub struct ManifestTree {
     /// manifests.
     pub content_files: Vec<String>,
 }
+
+/// Progress signal emitted during [`walk_many`]. Walking happens in two
+/// phases (manifest lists, then deduped manifests); the caller decides
+/// how to render each. `total` is `None` for the second phase until the
+/// first phase finishes — it isn't known until then.
+#[derive(Debug, Clone, Copy)]
+pub enum WalkEvent {
+    ManifestList { done: usize, total: usize },
+    Manifest { done: usize, total: usize },
+}
+
+/// Type alias for the optional progress callback. Implementations should
+/// be cheap and non-blocking — they're invoked from the I/O loop.
+pub type OnProgress<'a> = &'a (dyn Fn(WalkEvent) + Send + Sync);
 
 /// Read a manifest list Avro and return every `manifest_path` value.
 pub async fn read_manifest_list(
@@ -78,8 +93,12 @@ pub async fn walk_many(
     store: Arc<dyn ObjectStore>,
     manifest_list_paths: Vec<ObjPath>,
     parallelism: usize,
+    on_progress: Option<OnProgress<'_>>,
 ) -> Result<ManifestTree> {
     let parallelism = parallelism.max(1);
+
+    let manifest_lists_total = manifest_list_paths.len();
+    let manifest_lists_done = AtomicUsize::new(0);
 
     let lists_store = Arc::clone(&store);
     let manifest_path_groups: Vec<Vec<String>> = stream::iter(manifest_list_paths)
@@ -88,12 +107,24 @@ pub async fn walk_many(
             async move { read_manifest_list(&*store, &path).await }
         })
         .buffer_unordered(parallelism)
+        .inspect(|_| {
+            if let Some(cb) = on_progress {
+                let done = manifest_lists_done.fetch_add(1, Ordering::Relaxed) + 1;
+                cb(WalkEvent::ManifestList {
+                    done,
+                    total: manifest_lists_total,
+                });
+            }
+        })
         .try_collect()
         .await
         .context("reading manifest lists")?;
 
     let unique: HashSet<String> = manifest_path_groups.into_iter().flatten().collect();
     let manifest_files: Vec<String> = unique.into_iter().collect();
+
+    let manifests_total = manifest_files.len();
+    let manifests_done = AtomicUsize::new(0);
 
     let manifests_store = Arc::clone(&store);
     let content_groups: Vec<Vec<String>> = stream::iter(manifest_files.clone())
@@ -106,6 +137,15 @@ pub async fn walk_many(
             }
         })
         .buffer_unordered(parallelism)
+        .inspect(|_| {
+            if let Some(cb) = on_progress {
+                let done = manifests_done.fetch_add(1, Ordering::Relaxed) + 1;
+                cb(WalkEvent::Manifest {
+                    done,
+                    total: manifests_total,
+                });
+            }
+        })
         .try_collect()
         .await
         .context("reading manifests")?;

@@ -10,9 +10,15 @@
 //! absolute-path fields that drive these rewrites.
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt};
+
+/// Per-chunk progress callback used during the source `get` phase. The
+/// argument is the cumulative bytes received so far. Implementations
+/// should be fast and non-blocking — they're called from the I/O loop.
+pub type ProgressFn = dyn Fn(u64) + Send + Sync;
 
 #[derive(Debug, Clone, Copy)]
 pub enum FileType {
@@ -59,10 +65,34 @@ pub async fn copy_verbatim(
     src_path: &ObjPath,
     dst: &dyn ObjectStore,
     dst_path: &ObjPath,
+    progress: Option<&ProgressFn>,
 ) -> Result<()> {
-    let data = src.get(src_path).await?.bytes().await?;
+    let data = read_with_progress(src, src_path, progress).await?;
     dst.put(dst_path, data.into()).await?;
     Ok(())
+}
+
+/// Drain a `get` stream into one `Bytes`, calling `progress` after each
+/// chunk with the running total. Used by every copy variant — the only
+/// difference is what the caller does with the bytes afterwards.
+async fn read_with_progress(
+    src: &dyn ObjectStore,
+    src_path: &ObjPath,
+    progress: Option<&ProgressFn>,
+) -> Result<Bytes> {
+    let result = src.get(src_path).await?;
+    let mut stream = result.into_stream();
+    let mut buf = BytesMut::new();
+    let mut copied: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        copied += chunk.len() as u64;
+        if let Some(cb) = progress {
+            cb(copied);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
 }
 
 /// JSON copy with prefix substitution.
@@ -79,13 +109,14 @@ pub async fn copy_json(
     dst_path: &ObjPath,
     from_url: &str,
     to_url: &str,
+    progress: Option<&ProgressFn>,
 ) -> Result<()> {
     use flate2::read::GzDecoder;
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::{Read, Write};
 
-    let raw = src.get(src_path).await?.bytes().await?;
+    let raw = read_with_progress(src, src_path, progress).await?;
     let from_url = from_url.to_string();
     let to_url = to_url.to_string();
 
@@ -129,8 +160,9 @@ pub async fn copy_avro(
     dst_path: &ObjPath,
     from_url: &str,
     to_url: &str,
+    progress: Option<&ProgressFn>,
 ) -> Result<()> {
-    let data = src.get(src_path).await?.bytes().await?;
+    let data = read_with_progress(src, src_path, progress).await?;
     let from_url = from_url.to_string();
     let to_url = to_url.to_string();
 

@@ -11,7 +11,11 @@
 //! transfer — lives in `table::TableCopy`.
 
 mod file;
+mod paths;
+mod plan;
+mod progress;
 mod table;
+mod transfer;
 
 use std::sync::Arc;
 
@@ -21,14 +25,17 @@ use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
 use uuid::Uuid;
 
+use tokio::sync::Semaphore;
+
 use crate::cli::CopyArgs;
 use crate::config::S3Config;
 use crate::iceberg::metadata::find_latest;
 use crate::s3_url::S3Location;
+use crate::ui::Reporter;
 
 use table::{TableCopy, TableStats};
 
-pub async fn run(args: CopyArgs) -> Result<()> {
+pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
     let src_config = S3Config::from_file(&args.from_config)?;
     let dst_config = S3Config::from_file(&args.to_config)?;
 
@@ -39,7 +46,9 @@ pub async fn run(args: CopyArgs) -> Result<()> {
     let dst_store: Arc<dyn ObjectStore> = Arc::new(dst_config.build_store(&dst.bucket)?);
 
     tracing::info!(namespace = %args.from, "discovering tables");
+    reporter.global_status("discovering tables");
     let tables = discover_tables(&*src_store, &src.prefix).await?;
+    reporter.clear_global_status();
     if tables.is_empty() {
         return Err(anyhow!(
             "no Iceberg tables found under {} — expected UUID-named subdirectories with a metadata/ folder",
@@ -56,6 +65,19 @@ pub async fn run(args: CopyArgs) -> Result<()> {
 
     let shutdown = shutdown::Shutdown::new().context("registering shutdown signals")?;
 
+    let namespace_label = src
+        .prefix
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(&src.prefix)
+        .to_string();
+
+    // `tables.parallel` now caps only the file-copy phase. Discovery
+    // (manifest walks, dst scans) runs concurrently for every table —
+    // small tables don't have to wait for large tables to finish
+    // scanning before they can start copying.
+    let copy_gate = Arc::new(Semaphore::new(args.tables_parallel.max(1)));
+
     let copies = tables.iter().map(|uuid| TableCopy {
         src_store: Arc::clone(&src_store),
         dst_store: Arc::clone(&dst_store),
@@ -65,9 +87,13 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         dst_url: format!("{}/{uuid}", args.to),
         scope: args.scope,
         parallelism: args.copy_parallel,
+        reporter: reporter.clone(),
+        table_key: uuid.clone(),
+        namespace_label: namespace_label.clone(),
+        copy_gate: Arc::clone(&copy_gate),
     });
 
-    let result = run_concurrent(copies, args.tables_parallel, &shutdown).await?;
+    let result = run_concurrent(copies, &shutdown).await?;
 
     let total_copied: u64 = result.iter().map(|s| s.copied).sum();
     let total_skipped: u64 = result.iter().map(|s| s.skipped).sum();
@@ -80,25 +106,20 @@ pub async fn run(args: CopyArgs) -> Result<()> {
     Ok(())
 }
 
-/// Run table copies concurrently with a cap, returning their stats. The
-/// outer shutdown future short-circuits the whole orchestration on
+/// Schedule every `TableCopy` to start immediately. Each one self-paces:
+/// discovery runs in parallel across the whole namespace, while the
+/// file-copy phase is gated by the shared semaphore inside `TableCopy`
+/// so we never exceed `--tables.parallel` simultaneous transfers.
+///
+/// The outer shutdown future short-circuits the whole orchestration on
 /// Ctrl+C; each `TableCopy` finalises its own sync log when its future
 /// is dropped.
 async fn run_concurrent(
     copies: impl IntoIterator<Item = TableCopy>,
-    parallel: usize,
     shutdown: &shutdown::Shutdown,
 ) -> Result<Vec<TableStats>> {
-    let mut copies = copies.into_iter();
-    let mut in_flight = FuturesUnordered::new();
+    let mut in_flight: FuturesUnordered<_> = copies.into_iter().map(run_one).collect();
     let mut results = Vec::new();
-    let parallel = parallel.max(1);
-
-    for _ in 0..parallel {
-        if let Some(c) = copies.next() {
-            in_flight.push(run_one(c));
-        }
-    }
 
     loop {
         tokio::select! {
@@ -111,9 +132,6 @@ async fn run_concurrent(
                     Some((prefix, Ok(stats))) => {
                         tracing::info!(table = %prefix, copied = stats.copied, skipped = stats.skipped, "table done");
                         results.push(stats);
-                        if let Some(c) = copies.next() {
-                            in_flight.push(run_one(c));
-                        }
                     }
                     Some((prefix, Err(e))) => {
                         return Err(e.context(format!("table {prefix}")));
