@@ -87,9 +87,14 @@ impl ScanProgress {
     }
 }
 
-/// Counter triple shared with the file-copy closures. Every increment
-/// re-emits a `TableQueueChanged` so the TUI can show steady progress
-/// without each callsite needing to know about the renderer.
+/// Per-table counters shared with the file-copy closures. Every
+/// increment re-emits a `TableQueueChanged` so the TUI shows steady
+/// progress without each callsite needing to know about the renderer.
+///
+/// `failed` is tracked separately from `skipped`: a "skip" is a
+/// deliberate decision (already on the destination), while a "fail" is
+/// an I/O error we couldn't recover from. The next run will retry
+/// failed files because we never write a sync-log entry for them.
 pub(super) struct TableProgress {
     reporter: Reporter,
     key: String,
@@ -98,6 +103,7 @@ pub(super) struct TableProgress {
     total: AtomicU64,
     copied: AtomicU64,
     skipped: AtomicU64,
+    failed: AtomicU64,
 }
 
 impl TableProgress {
@@ -108,6 +114,7 @@ impl TableProgress {
             total: AtomicU64::new(0),
             copied: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
         })
     }
 
@@ -131,6 +138,11 @@ impl TableProgress {
         self.emit();
     }
 
+    pub(super) fn record_failed(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        self.emit();
+    }
+
     pub(super) fn copied_count(&self) -> u64 {
         self.copied.load(Ordering::Relaxed)
     }
@@ -139,11 +151,18 @@ impl TableProgress {
         self.skipped.load(Ordering::Relaxed)
     }
 
+    pub(super) fn failed_count(&self) -> u64 {
+        self.failed.load(Ordering::Relaxed)
+    }
+
     fn emit(&self) {
         let total = self.total.load(Ordering::Relaxed);
         let copied = self.copied_count();
         let skipped = self.skipped_count();
-        let queued = total.saturating_sub(copied + skipped);
+        let failed = self.failed_count();
+        // Failed files leave the queue too — otherwise the progress
+        // bar would stick at "queued > 0" forever after a failure.
+        let queued = total.saturating_sub(copied + skipped + failed);
         self.reporter
             .table_queue_changed(&self.key, queued, copied, skipped);
     }

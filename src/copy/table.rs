@@ -45,6 +45,10 @@ use super::transfer::{
 pub struct TableStats {
     pub copied: u64,
     pub skipped: u64,
+    /// Per-file I/O errors that the next run is expected to retry. No
+    /// sync-log entry is written for these, so the destination scan
+    /// will treat them as "missing" again next time.
+    pub failed: u64,
 }
 
 /// Configuration for one table within a namespace copy.
@@ -512,5 +516,6 @@ async fn finalize_with_stats(
     Ok(TableStats {
         copied: progress.copied_count(),
         skipped: progress.skipped_count(),
+        failed: progress.failed_count(),
     })
 }

@@ -55,11 +55,15 @@ pub(super) async fn process_relative(ctx: &FileTaskContext, relative: String) ->
     let head = match ctx.src_store.head(&src_path).await {
         Ok(h) => h,
         Err(object_store::Error::NotFound { .. }) => {
-            tracing::warn!(src = %src_path, "referenced file missing on source, skipping");
-            ctx.progress.record_skipped();
+            tracing::warn!(src = %src_path, "referenced file missing on source — will retry next run");
+            ctx.progress.record_failed();
             return Ok(());
         }
-        Err(e) => return Err(anyhow::Error::from(e)).context("HEAD source"),
+        Err(e) => {
+            tracing::warn!(src = %src_path, error = %e, "HEAD source failed — will retry next run");
+            ctx.progress.record_failed();
+            return Ok(());
+        }
     };
 
     if should_skip(
@@ -202,9 +206,11 @@ async fn run_copy(
     }
 }
 
-/// On success, increment the copied counter and append a sync-log entry.
-/// On error, log + count as skipped — a single bad file shouldn't fail
-/// the whole table copy.
+/// On success, increment the copied counter and append a sync-log
+/// entry. On error, log + count as failed — a single bad file shouldn't
+/// abort the whole table copy. We intentionally do NOT write a sync-log
+/// entry for failures, so the destination scan on the next run will
+/// treat the file as "missing" and retry the copy.
 #[allow(clippy::too_many_arguments)]
 async fn record_outcome(
     res: Result<()>,
@@ -233,12 +239,12 @@ async fn record_outcome(
             if e.downcast_ref::<object_store::Error>()
                 .is_some_and(|oe| matches!(oe, object_store::Error::NotFound { .. })) =>
         {
-            tracing::warn!(src = %src_path, "source file disappeared during copy, skipping");
-            progress.record_skipped();
+            tracing::warn!(src = %src_path, "source file disappeared during copy — will retry next run");
+            progress.record_failed();
         }
         Err(e) => {
-            tracing::warn!(src = %src_path, error = %e, "failed to copy file, skipping");
-            progress.record_skipped();
+            tracing::warn!(src = %src_path, error = %e, "failed to copy file — will retry next run");
+            progress.record_failed();
         }
     }
 }

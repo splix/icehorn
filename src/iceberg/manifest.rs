@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Context, Result};
 use apache_avro::types::Value;
 use apache_avro::Reader;
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, StreamExt};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 
@@ -100,11 +100,28 @@ pub async fn walk_many(
     let manifest_lists_total = manifest_list_paths.len();
     let manifest_lists_done = AtomicUsize::new(0);
 
+    // Per-item errors are downgraded to warnings: a missing/corrupted
+    // manifest list (or manifest) on the source shouldn't abort the
+    // whole table copy. Its referenced files simply won't make it into
+    // the to-copy list this run; the next run will pick them up if the
+    // failure was transient.
     let lists_store = Arc::clone(&store);
     let manifest_path_groups: Vec<Vec<String>> = stream::iter(manifest_list_paths)
         .map(move |path| {
             let store = Arc::clone(&lists_store);
-            async move { read_manifest_list(&*store, &path).await }
+            async move {
+                match read_manifest_list(&*store, &path).await {
+                    Ok(paths) => Some(paths),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path,
+                            error = %e,
+                            "failed to read manifest list — its data files will be skipped this run"
+                        );
+                        None
+                    }
+                }
+            }
         })
         .buffer_unordered(parallelism)
         .inspect(|_| {
@@ -116,9 +133,9 @@ pub async fn walk_many(
                 });
             }
         })
-        .try_collect()
-        .await
-        .context("reading manifest lists")?;
+        .filter_map(|maybe| async move { maybe })
+        .collect()
+        .await;
 
     let unique: HashSet<String> = manifest_path_groups.into_iter().flatten().collect();
     let manifest_files: Vec<String> = unique.into_iter().collect();
@@ -133,7 +150,17 @@ pub async fn walk_many(
             async move {
                 let key = strip_s3_prefix(&abs).unwrap_or(abs.as_str());
                 let path = ObjPath::from(key);
-                read_manifest(&*store, &path).await
+                match read_manifest(&*store, &path).await {
+                    Ok(files) => Some(files),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path,
+                            error = %e,
+                            "failed to read manifest — its data files will be skipped this run"
+                        );
+                        None
+                    }
+                }
             }
         })
         .buffer_unordered(parallelism)
@@ -146,9 +173,9 @@ pub async fn walk_many(
                 });
             }
         })
-        .try_collect()
-        .await
-        .context("reading manifests")?;
+        .filter_map(|maybe| async move { maybe })
+        .collect()
+        .await;
 
     let content_files: Vec<String> = content_groups.into_iter().flatten().collect();
 

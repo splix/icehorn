@@ -97,10 +97,12 @@ pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
 
     let total_copied: u64 = result.iter().map(|s| s.copied).sum();
     let total_skipped: u64 = result.iter().map(|s| s.skipped).sum();
+    let total_failed: u64 = result.iter().map(|s| s.failed).sum();
     tracing::info!(
         tables = table_count,
         copied = total_copied,
         skipped = total_skipped,
+        failed = total_failed,
         "namespace copy complete"
     );
     Ok(())
@@ -137,7 +139,13 @@ async fn run_concurrent(
             next = in_flight.join_next() => {
                 match next {
                     Some(Ok((prefix, Ok(stats)))) => {
-                        tracing::info!(table = %prefix, copied = stats.copied, skipped = stats.skipped, "table done");
+                        tracing::info!(
+                            table = %prefix,
+                            copied = stats.copied,
+                            skipped = stats.skipped,
+                            failed = stats.failed,
+                            "table done"
+                        );
                         results.push(stats);
                     }
                     Some(Ok((prefix, Err(e)))) => {
