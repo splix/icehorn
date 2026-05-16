@@ -242,22 +242,23 @@ impl TableCopy {
     }
 
     /// Find the latest metadata.json, pick the version we actually
-    /// want, and load it. Returns `None` (after logging a warning) if
-    /// the source `metadata/` directory has no usable
-    /// `<NNNNN>-<uuid>.metadata.json` or can't be listed — the caller
-    /// soft-skips the table in that case.
+    /// want, and load it. Returns `None` (after logging a warning) only
+    /// when the source `metadata/` directory has no usable
+    /// `<NNNNN>-<uuid>.metadata.json` — that's a legitimate empty-table
+    /// case. IO errors against `metadata/` propagate as `Err` so the
+    /// caller can mark this table as failed and let the namespace
+    /// continue with siblings (next run retries this table).
     async fn load_metadata(&self, version: Option<u32>) -> Result<Option<LoadedMetadata>> {
         self.reporter
             .table_status(&self.table_key, "loading metadata");
         let metadata_prefix = ObjPath::from(format!("{}/metadata", self.src_prefix));
-        let latest = match find_latest(&*self.src_store, &metadata_prefix).await {
-            Ok(Some(latest)) => latest,
-            Ok(None) => {
+        let latest = find_latest(&*self.src_store, &metadata_prefix)
+            .await
+            .with_context(|| format!("listing metadata/ for {}", self.src_prefix))?;
+        let latest = match latest {
+            Some(latest) => latest,
+            None => {
                 tracing::warn!(table = %self.src_prefix, "no metadata.json found — skipping");
-                return Ok(None);
-            }
-            Err(e) => {
-                tracing::warn!(table = %self.src_prefix, error = %e, "could not list metadata/ — skipping");
                 return Ok(None);
             }
         };

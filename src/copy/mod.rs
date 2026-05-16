@@ -93,16 +93,17 @@ pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
         copy_gate: Arc::clone(&copy_gate),
     });
 
-    let result = run_concurrent(copies, &shutdown).await?;
+    let (results, failed_tables) = run_concurrent(copies, &shutdown).await?;
 
-    let total_copied: u64 = result.iter().map(|s| s.copied).sum();
-    let total_skipped: u64 = result.iter().map(|s| s.skipped).sum();
-    let total_failed: u64 = result.iter().map(|s| s.failed).sum();
+    let total_copied: u64 = results.iter().map(|s| s.copied).sum();
+    let total_skipped: u64 = results.iter().map(|s| s.skipped).sum();
+    let total_failed_files: u64 = results.iter().map(|s| s.failed).sum();
     tracing::info!(
         tables = table_count,
         copied = total_copied,
         skipped = total_skipped,
-        failed = total_failed,
+        failed_files = total_failed_files,
+        failed_tables = failed_tables,
         "namespace copy complete"
     );
     Ok(())
@@ -116,25 +117,31 @@ pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
 /// `TableCopy` so we never exceed `--tables.parallel` simultaneous
 /// transfers.
 ///
+/// Per-table errors are logged and counted into `failed_tables` rather
+/// than aborting the whole namespace — a transient IO problem on one
+/// table shouldn't lose progress on the rest. The next run will retry
+/// any failed table because we never wrote a sync-log close for it.
+///
 /// The outer shutdown future short-circuits the whole orchestration on
 /// Ctrl+C; remaining tasks are aborted, and each `TableCopy` finalises
 /// its own sync log when its future is dropped.
 async fn run_concurrent(
     copies: impl IntoIterator<Item = TableCopy>,
     shutdown: &shutdown::Shutdown,
-) -> Result<Vec<TableStats>> {
+) -> Result<(Vec<TableStats>, u64)> {
     let mut in_flight: JoinSet<(String, Result<TableStats>)> = JoinSet::new();
     for copy in copies {
         in_flight.spawn(run_one(copy));
     }
     let mut results = Vec::new();
+    let mut failed_tables: u64 = 0;
 
     loop {
         tokio::select! {
             _ = shutdown.signalled() => {
                 tracing::info!("interrupted — abandoning in-flight table copies");
                 in_flight.abort_all();
-                return Ok(results);
+                return Ok((results, failed_tables));
             }
             next = in_flight.join_next() => {
                 match next {
@@ -149,13 +156,19 @@ async fn run_concurrent(
                         results.push(stats);
                     }
                     Some(Ok((prefix, Err(e)))) => {
-                        return Err(e.context(format!("table {prefix}")));
+                        tracing::warn!(
+                            table = %prefix,
+                            error = ?e,
+                            "table failed — siblings continue, retry on next run"
+                        );
+                        failed_tables += 1;
                     }
                     Some(Err(join_err)) if join_err.is_cancelled() => {
                         tracing::debug!("table task cancelled");
                     }
                     Some(Err(join_err)) => {
-                        return Err(anyhow!("table task panicked: {join_err}"));
+                        tracing::warn!(error = %join_err, "table task panicked — siblings continue");
+                        failed_tables += 1;
                     }
                     None => break,
                 }
@@ -163,7 +176,7 @@ async fn run_concurrent(
         }
     }
 
-    Ok(results)
+    Ok((results, failed_tables))
 }
 
 async fn run_one(copy: TableCopy) -> (String, Result<TableStats>) {
