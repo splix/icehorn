@@ -2,12 +2,11 @@
 //! the current schema as a table.
 
 use anyhow::{Context, Result};
-use object_store::path::Path as ObjPath;
 
 use crate::cli::TableArgs;
 use crate::config::S3Config;
-use crate::iceberg::metadata::{find_latest, read_json};
-use crate::iceberg::model::{Metadata, SchemaField};
+use crate::iceberg::metadata::load_latest;
+use crate::iceberg::model::SchemaField;
 use crate::s3_url::S3Location;
 
 pub async fn run(args: TableArgs) -> Result<()> {
@@ -15,14 +14,10 @@ pub async fn run(args: TableArgs) -> Result<()> {
     let location = S3Location::parse(&args.location)?;
     let store = config.build_store(&location.bucket)?;
 
-    let metadata_prefix = ObjPath::from(format!("{}/metadata", location.prefix));
-    let latest = find_latest(&store, &metadata_prefix)
+    let loaded = load_latest(&store, &location.prefix)
         .await?
         .context("no <NNNNN>-<uuid>.metadata.json files found under metadata/")?;
-
-    let bytes = read_json(&store, &latest.path).await?;
-    let meta: Metadata =
-        serde_json::from_slice(&bytes).context("failed to parse metadata JSON")?;
+    let meta = loaded.meta;
 
     let Some(schema) = meta.current_schema() else {
         println!("No current schema found in metadata.");

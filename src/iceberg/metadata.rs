@@ -10,6 +10,8 @@ use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use uuid::Uuid;
 
+use super::model::Metadata;
+
 /// Fixed width of a hyphenated UUID string (8-4-4-4-12 hex digits + 4 dashes).
 const UUID_LEN: usize = 36;
 
@@ -59,6 +61,31 @@ impl MetadataFile {
             path: path.clone(),
         })
     }
+}
+
+/// A fully loaded `<NNNNN>-<uuid>.metadata.json`: the file descriptor
+/// plus the parsed structure.
+pub struct LoadedMetadata {
+    pub file: MetadataFile,
+    pub meta: Metadata,
+}
+
+/// Resolve the latest `<NNNNN>-<uuid>.metadata.json` under
+/// `<table_prefix>/metadata` and read+parse it in one round-trip
+/// through the store. Returns `Ok(None)` when no version files are
+/// present; `show` treats that as a hard error, `copy` as a soft skip.
+pub async fn load_latest(
+    store: &(impl ObjectStore + ?Sized),
+    table_prefix: &str,
+) -> Result<Option<LoadedMetadata>> {
+    let metadata_prefix = ObjPath::from(format!("{table_prefix}/metadata"));
+    let Some(file) = find_latest(store, &metadata_prefix).await? else {
+        return Ok(None);
+    };
+    let raw = read_json(store, &file.path).await?;
+    let meta: Metadata = serde_json::from_slice(&raw)
+        .with_context(|| format!("parsing metadata.json {}", file.path))?;
+    Ok(Some(LoadedMetadata { file, meta }))
 }
 
 pub async fn find_latest(
@@ -253,6 +280,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(read_json(&store, &path).await.unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn load_latest_picks_highest_version_and_parses_metadata() {
+        use object_store::memory::InMemory;
+        use object_store::PutPayload;
+
+        let store = InMemory::new();
+        let table_prefix = "warehouse/tbl";
+
+        // Older version — should be ignored.
+        store
+            .put(
+                &ObjPath::from(format!(
+                    "{table_prefix}/metadata/00001-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.metadata.json"
+                )),
+                PutPayload::from_static(br#"{"format-version": 1}"#),
+            )
+            .await
+            .unwrap();
+        // Newer version — picked by find_latest.
+        store
+            .put(
+                &ObjPath::from(format!(
+                    "{table_prefix}/metadata/00007-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.metadata.json"
+                )),
+                PutPayload::from_static(br#"{"format-version": 2}"#),
+            )
+            .await
+            .unwrap();
+
+        let loaded = load_latest(&store, table_prefix)
+            .await
+            .unwrap()
+            .expect("load_latest should find a metadata file");
+        assert_eq!(loaded.file.version, 7);
+        assert_eq!(loaded.meta.format_version, 2);
+    }
+
+    #[tokio::test]
+    async fn load_latest_returns_none_when_metadata_dir_is_empty() {
+        use object_store::memory::InMemory;
+
+        let store = InMemory::new();
+        assert!(load_latest(&store, "warehouse/missing").await.unwrap().is_none());
     }
 
     #[tokio::test]

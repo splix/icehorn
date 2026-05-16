@@ -5,12 +5,11 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
-use object_store::path::Path as ObjPath;
 
 use crate::cli::TableArgs;
 use crate::config::S3Config;
-use crate::iceberg::metadata::{find_latest, read_json};
-use crate::iceberg::model::{Metadata, Snapshot};
+use crate::iceberg::metadata::load_latest;
+use crate::iceberg::model::Snapshot;
 use crate::s3_url::S3Location;
 
 /// How deep we walk the `parent-snapshot-id` chain beyond the current
@@ -23,19 +22,15 @@ pub async fn run(args: TableArgs) -> Result<()> {
     let location = S3Location::parse(&args.location)?;
     let store = config.build_store(&location.bucket)?;
 
-    let metadata_prefix = ObjPath::from(format!("{}/metadata", location.prefix));
-    let latest = find_latest(&store, &metadata_prefix)
+    let loaded = load_latest(&store, &location.prefix)
         .await?
         .context("no <NNNNN>-<uuid>.metadata.json files found under metadata/")?;
+    let file = loaded.file;
+    let meta = loaded.meta;
 
-    println!("Metadata file    : {}", latest.path.filename().unwrap_or("n/a"));
-    println!("Metadata version : {}", latest.version);
-    println!("Metadata id      : {}", latest.uuid);
-
-    let bytes = read_json(&store, &latest.path).await?;
-    let meta: Metadata =
-        serde_json::from_slice(&bytes).context("failed to parse metadata JSON")?;
-
+    println!("Metadata file    : {}", file.path.filename().unwrap_or("n/a"));
+    println!("Metadata version : {}", file.version);
+    println!("Metadata id      : {}", file.uuid);
     println!("Format version   : {}", meta.format_version);
     if let Some(uuid) = &meta.table_uuid {
         println!("Table UUID       : {uuid}");

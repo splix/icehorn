@@ -7,6 +7,7 @@
 //! `reference/iceberg-s3-migration.md` for the spec details that drive
 //! the parsers and walkers below.
 
+pub mod layout;
 pub mod manifest;
 pub mod metadata;
 pub mod model;

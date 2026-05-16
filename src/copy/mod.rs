@@ -21,15 +21,14 @@ mod transfer;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
-use uuid::Uuid;
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::cli::CopyArgs;
 use crate::config::S3Config;
+use crate::iceberg::layout::list_uuids;
 use crate::s3_url::S3Location;
 use crate::ui::Reporter;
 
@@ -175,33 +174,16 @@ async fn run_one(copy: TableCopy) -> (String, Result<TableStats>) {
 /// sometimes carry sibling junk (logs, docs, partial imports), and one
 /// bad subdir shouldn't block the rest.
 async fn discover_tables(store: &dyn ObjectStore, namespace_prefix: &str) -> Result<Vec<String>> {
-    let prefix = ObjPath::from(namespace_prefix);
-    let listing = store
-        .list_with_delimiter(Some(&prefix))
+    list_uuids(store, namespace_prefix)
         .await
-        .with_context(|| format!("listing namespace {namespace_prefix}"))?;
-
-    let tables: Vec<String> = listing
-        .common_prefixes
-        .iter()
-        .filter_map(|cp| {
-            let leaf = cp.as_ref().rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
-            if Uuid::parse_str(leaf).is_ok() {
-                Some(leaf.to_string())
-            } else {
-                tracing::debug!(path = %cp, "skipping non-UUID subdir");
-                None
-            }
-        })
-        .collect();
-
-    Ok(tables)
+        .with_context(|| format!("listing namespace {namespace_prefix}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    use object_store::path::Path as ObjPath;
     use object_store::{ObjectStoreExt, PutPayload};
 
     /// `discover_tables` returns every UUID-named subdir without

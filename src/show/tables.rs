@@ -11,13 +11,12 @@
 //! identified only by their UUID directory names — which is what real
 //! non-Hadoop Iceberg layouts on S3 already look like.
 
-use anyhow::{Context, Result};
-use object_store::path::Path as ObjPath;
+use anyhow::Result;
 use object_store::ObjectStore;
-use uuid::Uuid;
 
 use crate::cli::LocationArgs;
 use crate::config::S3Config;
+use crate::iceberg::layout::{is_uuid, last_segment, list_subdirs, list_uuids};
 use crate::s3_url::S3Location;
 
 /// Placeholder for a UUID we couldn't recover from the path — e.g. the
@@ -67,7 +66,7 @@ async fn discover(
     let probe_is_table = probe.iter().any(|s| s == "metadata");
 
     if probe_is_table {
-        let namespace = last_segment(location_prefix).to_string();
+        let namespace = last_segment(location_prefix).unwrap_or(UNKNOWN).to_string();
         return Ok(uuid_subdirs
             .into_iter()
             .map(|table| TableEntry {
@@ -80,8 +79,7 @@ async fn discover(
     let mut entries = Vec::new();
     for namespace in uuid_subdirs {
         let ns_path = format!("{location_prefix}/{namespace}");
-        let inner = list_subdirs(store, &ns_path).await?;
-        for table in inner.into_iter().filter(|s| is_uuid(s)) {
+        for table in list_uuids(store, &ns_path).await? {
             entries.push(TableEntry {
                 namespace: namespace.clone(),
                 table,
@@ -89,34 +87,6 @@ async fn discover(
         }
     }
     Ok(entries)
-}
-
-async fn list_subdirs(
-    store: &(impl ObjectStore + ?Sized),
-    prefix: &str,
-) -> Result<Vec<String>> {
-    let listing = store
-        .list_with_delimiter(Some(&ObjPath::from(prefix)))
-        .await
-        .with_context(|| format!("listing {prefix}"))?;
-    Ok(listing
-        .common_prefixes
-        .iter()
-        .filter_map(|cp| {
-            cp.as_ref()
-                .rsplit('/')
-                .find(|s| !s.is_empty())
-                .map(String::from)
-        })
-        .collect())
-}
-
-fn is_uuid(s: &str) -> bool {
-    Uuid::parse_str(s).is_ok()
-}
-
-fn last_segment(p: &str) -> &str {
-    p.rsplit('/').find(|s| !s.is_empty()).unwrap_or(UNKNOWN)
 }
 
 /// Split a `<prefix>/<ns>/<table>` path into its namespace and table
@@ -162,6 +132,7 @@ fn print_pairs(pairs: &[TableEntry]) {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    use object_store::path::Path as ObjPath;
     use object_store::{ObjectStoreExt, PutPayload};
 
     const NS_A: &str = "019d3bc6-1e12-79e3-a0a2-caa2f0aec0b7";
