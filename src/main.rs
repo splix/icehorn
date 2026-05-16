@@ -37,9 +37,14 @@ async fn main() -> Result<()> {
 }
 
 fn init_plain_logging() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    use tracing::Level;
+    // Match the TUI default: INFO and above when RUST_LOG is unset.
+    // Without this, `--plain` mode silently drops every tracing event
+    // because `EnvFilter::from_default_env()` produces an empty filter
+    // (rejects everything) when RUST_LOG isn't set.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(Level::INFO.to_string()));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 fn log_levels_enabled() {

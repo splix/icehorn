@@ -46,6 +46,11 @@ pub enum WalkEvent {
 pub type OnProgress<'a> = &'a (dyn Fn(WalkEvent) + Send + Sync);
 
 /// Read a manifest list Avro and return every `manifest_path` value.
+///
+/// The error chain deliberately omits the path: callers already have
+/// it on hand and log it as a structured field, and `object_store`'s
+/// own error message embeds the full URL, so adding it here would
+/// produce a third copy on one log line.
 pub async fn read_manifest_list(
     store: &dyn ObjectStore,
     path: &ObjPath,
@@ -53,7 +58,7 @@ pub async fn read_manifest_list(
     let bytes = store
         .get(path)
         .await
-        .with_context(|| format!("reading manifest list {path}"))?
+        .context("reading manifest list")?
         .bytes()
         .await?;
     let bytes = bytes.to_vec();
@@ -64,11 +69,13 @@ pub async fn read_manifest_list(
 }
 
 /// Read a manifest Avro and return every `data_file.file_path` value.
+/// See [`read_manifest_list`] for why the path is omitted from the
+/// error chain.
 pub async fn read_manifest(store: &dyn ObjectStore, path: &ObjPath) -> Result<Vec<String>> {
     let bytes = store
         .get(path)
         .await
-        .with_context(|| format!("reading manifest {path}"))?
+        .context("reading manifest")?
         .bytes()
         .await?;
     let bytes = bytes.to_vec();
