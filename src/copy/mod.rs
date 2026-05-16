@@ -2,9 +2,10 @@
 //!
 //! `--from` is expected to point at a *namespace* prefix that contains
 //! one or more tables as UUID-named subdirectories (each with a
-//! `metadata/` subdir of its own). The orchestrator below discovers the
-//! tables, validates each one looks like a real Iceberg table, then
-//! spawns a `TableCopy` per table and runs them concurrently.
+//! `metadata/` subdir of its own). The orchestrator below lists those
+//! UUID subdirs and spawns a `TableCopy` per table; whether each one
+//! is a real Iceberg table is decided inside the per-table pipeline,
+//! so a slow probe blocks only its own copy rather than the namespace.
 //!
 //! Per-table behavior — including which files are picked for `latest` /
 //! `all` / `<version>` scopes, sync-log handling, and parallel file
@@ -20,16 +21,15 @@ mod transfer;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use futures::stream::{FuturesUnordered, StreamExt};
 use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
 use uuid::Uuid;
 
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::cli::CopyArgs;
 use crate::config::S3Config;
-use crate::iceberg::metadata::find_latest;
 use crate::s3_url::S3Location;
 use crate::ui::Reporter;
 
@@ -55,8 +55,9 @@ pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
             args.from
         ));
     }
+    let table_count = tables.len();
     tracing::info!(
-        count = tables.len(),
+        count = table_count,
         scope = ?args.scope,
         tables_parallel = args.tables_parallel,
         copy_parallel = args.copy_parallel,
@@ -78,7 +79,7 @@ pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
     // scanning before they can start copying.
     let copy_gate = Arc::new(Semaphore::new(args.tables_parallel.max(1)));
 
-    let copies = tables.iter().map(|uuid| TableCopy {
+    let copies = tables.into_iter().map(|uuid| TableCopy {
         src_store: Arc::clone(&src_store),
         dst_store: Arc::clone(&dst_store),
         src_prefix: format!("{}/{uuid}", src.prefix),
@@ -98,7 +99,7 @@ pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
     let total_copied: u64 = result.iter().map(|s| s.copied).sum();
     let total_skipped: u64 = result.iter().map(|s| s.skipped).sum();
     tracing::info!(
-        tables = tables.len(),
+        tables = table_count,
         copied = total_copied,
         skipped = total_skipped,
         "namespace copy complete"
@@ -106,35 +107,48 @@ pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
     Ok(())
 }
 
-/// Schedule every `TableCopy` to start immediately. Each one self-paces:
-/// discovery runs in parallel across the whole namespace, while the
-/// file-copy phase is gated by the shared semaphore inside `TableCopy`
-/// so we never exceed `--tables.parallel` simultaneous transfers.
+/// Spawn each `TableCopy` as its own tokio task so they're scheduled
+/// across the runtime's worker threads — discovery I/O and the work
+/// between awaits (manifest parsing, hashmap building) overlap for
+/// every table at once, not just S3 round-trips on a single task. The
+/// file-copy phase is still gated by the shared semaphore inside
+/// `TableCopy` so we never exceed `--tables.parallel` simultaneous
+/// transfers.
 ///
 /// The outer shutdown future short-circuits the whole orchestration on
-/// Ctrl+C; each `TableCopy` finalises its own sync log when its future
-/// is dropped.
+/// Ctrl+C; remaining tasks are aborted, and each `TableCopy` finalises
+/// its own sync log when its future is dropped.
 async fn run_concurrent(
     copies: impl IntoIterator<Item = TableCopy>,
     shutdown: &shutdown::Shutdown,
 ) -> Result<Vec<TableStats>> {
-    let mut in_flight: FuturesUnordered<_> = copies.into_iter().map(run_one).collect();
+    let mut in_flight: JoinSet<(String, Result<TableStats>)> = JoinSet::new();
+    for copy in copies {
+        in_flight.spawn(run_one(copy));
+    }
     let mut results = Vec::new();
 
     loop {
         tokio::select! {
             _ = shutdown.signalled() => {
                 tracing::info!("interrupted — abandoning in-flight table copies");
+                in_flight.abort_all();
                 return Ok(results);
             }
-            next = in_flight.next() => {
+            next = in_flight.join_next() => {
                 match next {
-                    Some((prefix, Ok(stats))) => {
+                    Some(Ok((prefix, Ok(stats)))) => {
                         tracing::info!(table = %prefix, copied = stats.copied, skipped = stats.skipped, "table done");
                         results.push(stats);
                     }
-                    Some((prefix, Err(e))) => {
+                    Some(Ok((prefix, Err(e)))) => {
                         return Err(e.context(format!("table {prefix}")));
+                    }
+                    Some(Err(join_err)) if join_err.is_cancelled() => {
+                        tracing::debug!("table task cancelled");
+                    }
+                    Some(Err(join_err)) => {
+                        return Err(anyhow!("table task panicked: {join_err}"));
                     }
                     None => break,
                 }
@@ -152,16 +166,14 @@ async fn run_one(copy: TableCopy) -> (String, Result<TableStats>) {
     (prefix, res)
 }
 
-/// List the namespace one level deep, validate each subdir is a
-/// UUID-named table with a `metadata/` containing at least one parseable
-/// `<NNNNN>-<uuid>.metadata.json`, and return the table UUIDs in
-/// listing order. Each found table is logged with its latest metadata
-/// version so a human watching the run can sanity-check the source.
+/// List the namespace one level deep and return the UUID-named subdirs.
+/// One LIST call against S3; whether each UUID is actually a valid
+/// Iceberg table is left to the per-table pipeline so a slow probe
+/// blocks only its own copy, not the whole namespace.
 ///
-/// Non-UUID directories and UUID directories without a usable
-/// `metadata/` are skipped with a warning rather than failing the run —
-/// real namespaces sometimes carry sibling junk (logs, docs, partial
-/// imports), and one bad subdir shouldn't block the rest.
+/// Non-UUID directories are skipped with a debug log — real namespaces
+/// sometimes carry sibling junk (logs, docs, partial imports), and one
+/// bad subdir shouldn't block the rest.
 async fn discover_tables(store: &dyn ObjectStore, namespace_prefix: &str) -> Result<Vec<String>> {
     let prefix = ObjPath::from(namespace_prefix);
     let listing = store
@@ -169,33 +181,19 @@ async fn discover_tables(store: &dyn ObjectStore, namespace_prefix: &str) -> Res
         .await
         .with_context(|| format!("listing namespace {namespace_prefix}"))?;
 
-    let mut tables = Vec::new();
-    for cp in &listing.common_prefixes {
-        let leaf = cp.as_ref().rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
-        if Uuid::parse_str(leaf).is_err() {
-            tracing::debug!(path = %cp, "skipping non-UUID subdir");
-            continue;
-        }
-
-        let metadata_prefix = ObjPath::from(format!("{namespace_prefix}/{leaf}/metadata"));
-        match find_latest(store, &metadata_prefix).await {
-            Ok(Some(latest)) => {
-                tracing::info!(
-                    table = %leaf,
-                    version = latest.version,
-                    metadata = %latest.path.filename().unwrap_or(""),
-                    "found table"
-                );
-                tables.push(leaf.to_string());
+    let tables: Vec<String> = listing
+        .common_prefixes
+        .iter()
+        .filter_map(|cp| {
+            let leaf = cp.as_ref().rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+            if Uuid::parse_str(leaf).is_ok() {
+                Some(leaf.to_string())
+            } else {
+                tracing::debug!(path = %cp, "skipping non-UUID subdir");
+                None
             }
-            Ok(None) => {
-                tracing::warn!(table = %leaf, "UUID dir has no metadata.json — skipping");
-            }
-            Err(e) => {
-                tracing::warn!(table = %leaf, error = %e, "could not check metadata/ — skipping");
-            }
-        }
-    }
+        })
+        .collect();
 
     Ok(tables)
 }
@@ -206,38 +204,39 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::{ObjectStoreExt, PutPayload};
 
-    /// `discover_tables` should return only UUID-named subdirs that have
-    /// a parseable metadata.json. Junk dirs and empty UUID dirs are
-    /// silently skipped, since real namespaces accumulate both.
+    /// `discover_tables` returns every UUID-named subdir without
+    /// probing its `metadata/`. Whether each candidate is actually a
+    /// usable Iceberg table is decided by the per-table pipeline; junk
+    /// directories named with a non-UUID leaf are filtered out here.
     #[tokio::test]
-    async fn discovers_only_valid_tables_under_namespace() {
+    async fn discovers_uuid_named_subdirs_under_namespace() {
         let store = InMemory::new();
         let ns = "iceberg/ns-uuid";
 
-        let valid_uuid = "019d3bc6-1e12-79e3-a0a2-caa2f0aec0b7";
-        let other_uuid = "019d9daf-e720-7131-ba9a-b771f5c2b2f1";
+        let with_metadata = "019d3bc6-1e12-79e3-a0a2-caa2f0aec0b7";
+        let without_metadata = "019d9daf-e720-7131-ba9a-b771f5c2b2f1";
 
-        // Valid table.
         store
             .put(
                 &ObjPath::from(format!(
-                    "{ns}/{valid_uuid}/metadata/00001-65f87f03-6d7e-41be-8dce-c813ffe70937.metadata.json"
+                    "{ns}/{with_metadata}/metadata/00001-65f87f03-6d7e-41be-8dce-c813ffe70937.metadata.json"
                 )),
                 PutPayload::from_static(b"{}"),
             )
             .await
             .unwrap();
 
-        // UUID dir but no metadata file — should be skipped.
+        // UUID dir with no metadata file — still returned; the per-table
+        // pipeline is responsible for soft-skipping it later.
         store
             .put(
-                &ObjPath::from(format!("{ns}/{other_uuid}/data/file.parquet")),
+                &ObjPath::from(format!("{ns}/{without_metadata}/data/file.parquet")),
                 PutPayload::from_static(b""),
             )
             .await
             .unwrap();
 
-        // Non-UUID sibling — should be skipped.
+        // Non-UUID sibling — filtered out here.
         store
             .put(
                 &ObjPath::from(format!("{ns}/notes/readme.txt")),
@@ -246,8 +245,12 @@ mod tests {
             .await
             .unwrap();
 
-        let tables = discover_tables(&store, ns).await.unwrap();
-        assert_eq!(tables, vec![valid_uuid.to_string()]);
+        let mut tables = discover_tables(&store, ns).await.unwrap();
+        tables.sort();
+        assert_eq!(
+            tables,
+            vec![with_metadata.to_string(), without_metadata.to_string()]
+        );
     }
 
     #[tokio::test]

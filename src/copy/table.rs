@@ -26,7 +26,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::cli::Scope;
 use crate::iceberg::manifest::{self, ManifestTree, WalkEvent};
-use crate::iceberg::metadata::{MetadataFile, read_json};
+use crate::iceberg::metadata::{MetadataFile, find_latest, read_json};
 use crate::iceberg::model::Metadata;
 use crate::sync_log;
 use crate::ui::Reporter;
@@ -131,8 +131,14 @@ impl TableCopy {
     /// destination already (from a previous run) or is being copied
     /// now — so repeated incremental runs grow the destination history
     /// without orphaning files.
+    ///
+    /// If the source `metadata/` is missing or unreadable, the table is
+    /// soft-skipped with a warning and zero stats — the namespace copy
+    /// keeps going for the rest.
     async fn run_filtered(&self, version: Option<u32>) -> Result<TableStats> {
-        let loaded = self.load_metadata(version).await?;
+        let Some(loaded) = self.load_metadata(version).await? else {
+            return Ok(TableStats::default());
+        };
         let plan = build_plan(
             &self.src_url,
             &loaded.meta,
@@ -231,14 +237,31 @@ impl TableCopy {
         })
     }
 
-    async fn load_metadata(&self, version: Option<u32>) -> Result<LoadedMetadata> {
+    /// Find the latest metadata.json, pick the version we actually
+    /// want, and load it. Returns `None` (after logging a warning) if
+    /// the source `metadata/` directory has no usable
+    /// `<NNNNN>-<uuid>.metadata.json` or can't be listed — the caller
+    /// soft-skips the table in that case.
+    async fn load_metadata(&self, version: Option<u32>) -> Result<Option<LoadedMetadata>> {
         self.reporter
             .table_status(&self.table_key, "loading metadata");
         let metadata_prefix = ObjPath::from(format!("{}/metadata", self.src_prefix));
-        let chosen = pick_metadata(&*self.src_store, &metadata_prefix, version).await?;
+        let latest = match find_latest(&*self.src_store, &metadata_prefix).await {
+            Ok(Some(latest)) => latest,
+            Ok(None) => {
+                tracing::warn!(table = %self.src_prefix, "no metadata.json found — skipping");
+                return Ok(None);
+            }
+            Err(e) => {
+                tracing::warn!(table = %self.src_prefix, error = %e, "could not list metadata/ — skipping");
+                return Ok(None);
+            }
+        };
+        let chosen = pick_metadata(&*self.src_store, &metadata_prefix, version, &latest).await?;
         tracing::info!(
             table = %self.src_prefix,
             version = chosen.version,
+            metadata = %chosen.path.filename().unwrap_or(""),
             "loading metadata"
         );
 
@@ -247,12 +270,12 @@ impl TableCopy {
             .with_context(|| format!("parsing metadata.json {}", chosen.path))?;
         let dst_existing_meta =
             list_dst_metadata_filenames(&*self.dst_store, &self.dst_prefix).await?;
-        Ok(LoadedMetadata {
+        Ok(Some(LoadedMetadata {
             chosen,
             raw_size: raw.len(),
             meta,
             dst_existing_meta,
-        })
+        }))
     }
 
     /// Filter the in-memory `Metadata` to match the kept set, build the

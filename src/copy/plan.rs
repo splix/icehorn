@@ -13,7 +13,7 @@ use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
 
-use crate::iceberg::metadata::{MetadataFile, find_latest};
+use crate::iceberg::metadata::MetadataFile;
 use crate::iceberg::model::Metadata;
 use crate::sync_log;
 
@@ -65,17 +65,19 @@ pub(super) async fn build_plan(
     })
 }
 
+/// Pick the metadata.json to copy. `discovered_latest` is reused from
+/// the namespace-wide discovery pass to avoid re-listing `metadata/` —
+/// the only case that still has to walk S3 is `--scope <N>` where the
+/// requested version differs from the latest.
 pub(super) async fn pick_metadata(
     store: &dyn ObjectStore,
     metadata_prefix: &ObjPath,
     version: Option<u32>,
+    discovered_latest: &MetadataFile,
 ) -> Result<MetadataFile> {
-    let latest = find_latest(store, metadata_prefix)
-        .await?
-        .ok_or_else(|| anyhow!("no <NNNNN>-<uuid>.metadata.json files found under metadata/"))?;
     match version {
-        None => Ok(latest),
-        Some(v) if v == latest.version => Ok(latest),
+        None => Ok(discovered_latest.clone()),
+        Some(v) if v == discovered_latest.version => Ok(discovered_latest.clone()),
         Some(v) => find_specific_version(store, metadata_prefix, v).await,
     }
 }

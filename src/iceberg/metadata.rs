@@ -16,6 +16,7 @@ const UUID_LEN: usize = 36;
 /// The parsed `<version>-<uuid>.metadata.json[.gz]` descriptor used by
 /// non-Hadoop catalogs. The UUID here is independent of any UUID in the
 /// metadata payload itself (see reference/iceberg-naming-conventions.md).
+#[derive(Debug, Clone)]
 pub struct MetadataFile {
     pub version: u32,
     pub uuid: Uuid,
