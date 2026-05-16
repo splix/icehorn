@@ -10,14 +10,25 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use futures::TryStreamExt;
-use object_store::ObjectStore;
+use futures::stream::{self, StreamExt};
 use object_store::path::Path as ObjPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 
 use crate::iceberg::metadata::MetadataFile;
 use crate::iceberg::model::Metadata;
 use crate::sync_log;
 
 use super::paths::{filename_of, relative_under, strip_url_prefix};
+
+/// To-copy count below which we probe the destination per-file via
+/// HEAD instead of paginating the entire prefix with LIST. On a
+/// long-lived destination (hundreds of thousands of files) the full
+/// LIST dominates the table-prep time; for the typical incremental
+/// run (a handful of new files since last time), N HEADs in parallel
+/// finish in a fraction of a second. The threshold is roughly the
+/// page size of an S3 LIST so the request count stays in the same
+/// order of magnitude in either branch.
+pub(super) const HEAD_PROBE_THRESHOLD: usize = 1000;
 
 /// What gets kept from the source's `snapshots[]` after intersecting
 /// with the destination's existing manifest-list files.
@@ -116,6 +127,53 @@ pub(super) async fn list_dst_metadata_filenames(
         .await
         .context("listing destination metadata/")?;
     Ok(names.into_iter().collect())
+}
+
+/// Probe the destination one file at a time for a known set of
+/// relative paths. Use this instead of [`list_existing`] when the set
+/// is small relative to the destination — N parallel HEADs beat a
+/// full LIST that paginates through hundreds of thousands of unrelated
+/// keys.
+///
+/// Files that 404 are omitted from the returned map (the file-copy
+/// phase then treats them as "not present" and tries to copy them).
+/// Other HEAD errors are logged and the file is treated as not
+/// present too — `process_relative` will surface the failure loudly
+/// enough when the copy itself runs.
+pub(super) async fn head_existing(
+    store: Arc<dyn ObjectStore>,
+    dst_prefix: &str,
+    relative_paths: &[String],
+    parallelism: usize,
+) -> Result<Arc<HashMap<String, u64>>> {
+    let dst_prefix = dst_prefix.to_string();
+    let parallelism = parallelism.max(1);
+
+    let results: Vec<Option<(String, u64)>> = stream::iter(relative_paths.iter().cloned())
+        .map(|rel| {
+            let store = Arc::clone(&store);
+            let dst_prefix = dst_prefix.clone();
+            async move {
+                let dst_path = ObjPath::from(format!("{dst_prefix}/{rel}"));
+                match store.head(&dst_path).await {
+                    Ok(meta) => Some((rel, meta.size)),
+                    Err(object_store::Error::NotFound { .. }) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %dst_path,
+                            error = %e,
+                            "HEAD failed during dst scan — assuming not present"
+                        );
+                        None
+                    }
+                }
+            }
+        })
+        .buffer_unordered(parallelism)
+        .collect()
+        .await;
+
+    Ok(Arc::new(results.into_iter().flatten().collect()))
 }
 
 /// Walk the destination and return `(relative_key, size)` for every

@@ -34,7 +34,8 @@ use crate::ui::Reporter;
 use super::file;
 use super::paths::{relative_under, strip_url_prefix};
 use super::plan::{
-    CopyPlan, build_plan, list_dst_metadata_filenames, list_existing, load_sync_log, pick_metadata,
+    CopyPlan, HEAD_PROBE_THRESHOLD, build_plan, head_existing, list_dst_metadata_filenames,
+    list_existing, load_sync_log, pick_metadata,
 };
 use super::progress::{ScanProgress, TableProgress};
 use super::transfer::{
@@ -150,8 +151,16 @@ impl TableCopy {
             &loaded.dst_existing_meta,
         )
         .await?;
-        let scanned = self.discover_filtered(&plan).await?;
-        let prepared = self.prepare_filtered_copy(loaded, plan, scanned.tree)?;
+
+        // Walk source manifests + load the prior sync log in parallel.
+        // The dst scan is deferred until we know `to_copy.len()` so we
+        // can pick between a full LIST and HEAD-per-file — the latter
+        // is dramatically faster when only a handful of files are new
+        // but the destination already holds hundreds of thousands.
+        let (tree, prev_sync) = self.walk_and_load_sync(&plan).await?;
+        let prepared = self.prepare_filtered_copy(loaded, plan, tree)?;
+        let existing = self.scan_dst_for_paths(&prepared.to_copy).await?;
+        let scanned = DestinationScan { existing, prev_sync };
 
         let (sync_tx, sync_writer) =
             sync_log::start_writer(Arc::clone(&self.dst_store), self.dst_prefix.clone());
@@ -169,7 +178,7 @@ impl TableCopy {
         self.reporter.table_status(&self.table_key, "copying");
 
         let stream_result = self
-            .stream_planned_copy(&prepared, &scanned.dst, &sync_tx, &progress)
+            .stream_planned_copy(&prepared, &scanned, &sync_tx, &progress)
             .await;
         let after_meta = self
             .write_rewritten_metadata(stream_result, &prepared, &progress, &sync_tx)
@@ -195,16 +204,22 @@ impl TableCopy {
         Ok(DestinationScan { existing, prev_sync })
     }
 
-    async fn discover_filtered(&self, plan: &CopyPlan) -> Result<FilteredScan> {
+    /// Walk the source's manifest tree and load any prior sync log
+    /// concurrently. Both feed the planning step; neither needs the
+    /// destination listing, so we keep them off the critical path of
+    /// the dst scan (which can take tens of seconds against a
+    /// long-lived warehouse).
+    async fn walk_and_load_sync(
+        &self,
+        plan: &CopyPlan,
+    ) -> Result<(ManifestTree, Arc<HashMap<String, sync_log::Entry>>)> {
         let manifest_list_abs: Vec<ObjPath> = plan
             .kept_manifest_lists
             .iter()
             .map(|ml| ObjPath::from(format!("{}/{}", self.src_prefix, ml)))
             .collect();
-        self.reporter.table_status(
-            &self.table_key,
-            "walking manifest tree and scanning destination",
-        );
+        self.reporter
+            .table_status(&self.table_key, "walking manifest tree");
         let scan = ScanProgress::new(self.reporter.clone(), self.table_key.clone());
         let scan_for_walk = Arc::clone(&scan);
         let on_walk = move |ev: WalkEvent| match ev {
@@ -213,8 +228,6 @@ impl TableCopy {
             }
             WalkEvent::Manifest { done, total } => scan_for_walk.record_manifest(done, total),
         };
-        let scan_for_dst = Arc::clone(&scan);
-        let on_dst = move |n: u64| scan_for_dst.record_dst_objects(n);
 
         let walk_fut = manifest::walk_many(
             Arc::clone(&self.src_store),
@@ -222,23 +235,51 @@ impl TableCopy {
             self.parallelism,
             Some(&on_walk),
         );
-        let existing_fut = list_existing(&*self.dst_store, &self.dst_prefix, Some(&on_dst));
         let prev_sync_fut = async {
             Ok::<_, anyhow::Error>(load_sync_log(&*self.dst_store, &self.dst_prefix).await)
         };
-        let (tree, existing, prev_sync) = tokio::try_join!(walk_fut, existing_fut, prev_sync_fut)
-            .context("walking source and scanning destination")?;
+        let (tree, prev_sync) = tokio::try_join!(walk_fut, prev_sync_fut)
+            .context("walking source and loading sync log")?;
         tracing::info!(
             table = %self.src_prefix,
             unique_manifests = tree.manifest_files.len(),
             content_files = tree.content_files.len(),
-            dst_objects = existing.len(),
-            "manifest tree walked, destination scanned"
+            "manifest tree walked"
         );
-        Ok(FilteredScan {
-            tree,
-            dst: DestinationScan { existing, prev_sync },
-        })
+        Ok((tree, prev_sync))
+    }
+
+    /// Decide how to probe the destination for files in `to_copy`.
+    /// Below [`HEAD_PROBE_THRESHOLD`] we HEAD each candidate in
+    /// parallel — much faster than paginating the entire dst prefix
+    /// when only a handful of files are new but the destination already
+    /// holds hundreds of thousands of unrelated objects. Above the
+    /// threshold we fall back to a full LIST whose per-request
+    /// amortised cost beats N individual HEADs.
+    async fn scan_dst_for_paths(&self, to_copy: &[String]) -> Result<Arc<HashMap<String, u64>>> {
+        if to_copy.len() <= HEAD_PROBE_THRESHOLD {
+            self.reporter.table_status(
+                &self.table_key,
+                format!("checking {} files on destination", to_copy.len()),
+            );
+            head_existing(
+                Arc::clone(&self.dst_store),
+                &self.dst_prefix,
+                to_copy,
+                self.parallelism,
+            )
+            .await
+            .context("HEAD-probing destination")
+        } else {
+            self.reporter
+                .table_status(&self.table_key, "scanning destination (full list)");
+            let scan = ScanProgress::new(self.reporter.clone(), self.table_key.clone());
+            let scan_for_dst = Arc::clone(&scan);
+            let on_dst = move |n: u64| scan_for_dst.record_dst_objects(n);
+            list_existing(&*self.dst_store, &self.dst_prefix, Some(&on_dst))
+                .await
+                .context("listing destination")
+        }
     }
 
     /// Find the latest metadata.json, pick the version we actually
@@ -422,11 +463,6 @@ impl TableCopy {
 struct DestinationScan {
     existing: Arc<HashMap<String, u64>>,
     prev_sync: Arc<HashMap<String, sync_log::Entry>>,
-}
-
-struct FilteredScan {
-    tree: ManifestTree,
-    dst: DestinationScan,
 }
 
 struct LoadedMetadata {
