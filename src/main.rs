@@ -49,7 +49,6 @@ fn init_plain_logging() {
 }
 
 fn log_levels_enabled() {
-    tracing::info!("INFO log enabled");
     tracing::debug!("DEBUG log enabled");
     tracing::trace!("TRACE log enabled");
 }
