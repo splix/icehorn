@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use tui_logger::{TuiLoggerLevelOutput, TuiLoggerWidget};
 
 use super::event::CopyEvent;
+use super::speed::SpeedTracker;
 
 /// Lines reserved for log output. Fits the recent useful chatter
 /// without dominating the view.
@@ -97,6 +98,10 @@ fn main_loop(
             }
         }
 
+        // Sample throughput just before drawing — keeps the displayed
+        // rate decaying smoothly even when no FileProgress events
+        // arrived this tick (e.g. all in-flight files stalled).
+        state.refresh_speed(Instant::now());
         terminal.draw(|frame| draw(frame, &state))?;
 
         if closed {
@@ -120,9 +125,16 @@ fn main_loop(
 /// gets a clean stream — same convention as `tracing` logs in
 /// `--plain` mode.
 fn print_summary(state: &State) {
-    let elapsed = format_elapsed(state.started_at.elapsed());
+    let elapsed_dur = state.started_at.elapsed();
+    let elapsed = format_elapsed(elapsed_dur);
     let total_files = state.overall_copied + state.overall_skipped;
     let bytes_str = format_size(state.overall_bytes_copied);
+    // Lifetime average — the rolling-window rate is meaningless after
+    // the copy has ended, so the summary reports total/elapsed for an
+    // honest "what did we sustain across the whole run" number. When
+    // nothing was actually copied (all-skipped run) it's `None` and
+    // the renderer prints `--` rather than a misleading "0.0KB/s".
+    let avg_rate = lifetime_rate(state.overall_bytes_copied, elapsed_dur);
 
     eprintln!();
     eprintln!("Copy summary");
@@ -132,7 +144,7 @@ fn print_summary(state: &State) {
         "  Files   : {} copied, {} skipped ({total_files} total)",
         state.overall_copied, state.overall_skipped
     );
-    eprintln!("  Bytes   : {bytes_str} transferred");
+    eprintln!("  Bytes   : {bytes_str} transferred ({})", format_rate(avg_rate));
 
     // Per-table breakdown when there's more than one — single-table
     // runs would just duplicate the totals above.
@@ -162,10 +174,10 @@ struct State {
     /// In-flight file rows in insertion order, so the visible list is
     /// stable as new files come and go.
     files: Vec<FileState>,
-    /// Total bytes transferred across every file copy that has finished
-    /// this session — copied or partial. Skipped files don't add. We
-    /// take the value from each `FileState.copied_bytes` at finish so a
-    /// failed mid-transfer still reflects the truth.
+    /// Cumulative bytes that have actually crossed the wire — updated
+    /// live on every `FileProgress` delta, not just on finish, so the
+    /// header total ticks during a long-running file instead of
+    /// jumping by half a gigabyte at the end of each one.
     overall_bytes_copied: u64,
     overall_copied: u64,
     overall_skipped: u64,
@@ -173,6 +185,15 @@ struct State {
     /// Status text shown when no table-specific status applies
     /// (typically: pre-table discovery phase).
     global_status: Option<String>,
+    /// Rolling-window throughput tracker. Fed the same byte deltas
+    /// that grow `overall_bytes_copied`.
+    speed: SpeedTracker,
+    /// Last sampled speed (bytes/sec) — recomputed once per draw tick
+    /// by `main_loop` so the rate still falls to zero when nothing is
+    /// streaming, and so draw functions can stay `&State`. `None`
+    /// until the first byte is recorded, which the renderer displays
+    /// as `--` rather than a misleading "0.0KB/s" during discovery.
+    cached_bytes_per_sec: Option<u64>,
 }
 
 struct TableState {
@@ -205,7 +226,17 @@ impl State {
             overall_skipped: 0,
             overall_queued: 0,
             global_status: None,
+            speed: SpeedTracker::new(),
+            cached_bytes_per_sec: None,
         }
+    }
+
+    /// Resample the throughput tracker. Called once per draw tick so
+    /// the displayed rate decays during quiet periods even when no
+    /// new bytes are arriving. `None` while the tracker hasn't seen
+    /// its first byte yet (the discovery phase).
+    fn refresh_speed(&mut self, now: Instant) {
+        self.cached_bytes_per_sec = self.speed.bytes_per_sec(now);
     }
 
     fn apply(&mut self, ev: CopyEvent) {
@@ -258,12 +289,25 @@ impl State {
             }
             CopyEvent::FileProgress { id, copied_bytes } => {
                 if let Some(f) = self.files.iter_mut().find(|f| f.id == id) {
+                    // Per-chunk events report cumulative bytes for the
+                    // file; the global total + speed tracker want
+                    // deltas, so we diff against what we last saw.
+                    // `saturating_sub` guards against any out-of-order
+                    // event that would otherwise underflow.
+                    let delta = copied_bytes.saturating_sub(f.copied_bytes);
                     f.copied_bytes = copied_bytes;
+                    if delta > 0 {
+                        self.overall_bytes_copied += delta;
+                        self.speed.record(delta, Instant::now());
+                    }
                 }
             }
             CopyEvent::FileFinished { id } => {
+                // `overall_bytes_copied` already includes every byte
+                // this file streamed (we summed deltas as they arrived
+                // via `FileProgress`), so removing the row is enough —
+                // no extra accounting needed.
                 if let Some(idx) = self.files.iter().position(|f| f.id == id) {
-                    self.overall_bytes_copied += self.files[idx].copied_bytes;
                     self.files.remove(idx);
                 }
             }
@@ -357,7 +401,8 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &State) {
     let total = state.overall_queued + state.overall_copied + state.overall_skipped;
     let done = state.overall_copied + state.overall_skipped;
     let bytes_str = format_size(state.overall_bytes_copied);
-    let totals = format!("  ·  {done}/{total} files  ·  {bytes_str} copied");
+    let rate_str = format_rate(state.cached_bytes_per_sec);
+    let totals = format!("  ·  {done}/{total} files  ·  {bytes_str} copied  ·  {rate_str}");
 
     let line = Line::from(vec![
         Span::styled("[", Style::new().fg(DIM)),
@@ -604,6 +649,30 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Throughput display — same MB/KB conventions as `format_size`,
+/// suffixed with `/s`. `None` means "no transfer activity yet" (the
+/// pre-first-byte discovery phase, or an all-skipped run); we render
+/// `--` so the user can tell that state apart from a real 0.0KB/s
+/// stall.
+fn format_rate(bytes_per_sec: Option<u64>) -> String {
+    match bytes_per_sec {
+        Some(bps) => format!("{}/s", format_size(bps)),
+        None => "--".to_string(),
+    }
+}
+
+/// Total bytes divided by elapsed seconds, with a 1-second floor so
+/// a sub-second elapsed time doesn't blow up the divisor. `None` when
+/// no bytes were copied — distinguishes an all-skipped run from a
+/// sustained-zero-throughput one.
+fn lifetime_rate(bytes: u64, elapsed: Duration) -> Option<u64> {
+    if bytes == 0 {
+        return None;
+    }
+    let secs = elapsed.as_secs().max(1);
+    Some(bytes / secs)
+}
+
 fn truncate(s: &str, max: usize) -> String {
     // Iceberg filenames are usually `<UUID>-mNN.avro` or long-hash
     // parquet files — the tail carries no extra signal once truncated,
@@ -628,6 +697,60 @@ mod tests {
         assert_eq!(format_size(512), "0.5KB");
         assert_eq!(format_size(1024 * 1024), "1.00MB");
         assert_eq!(format_size(2 * 1024 * 1024 + 512 * 1024), "2.50MB");
+    }
+
+    #[test]
+    fn format_rate_suffixes_with_per_second_or_dashes_when_none() {
+        assert_eq!(format_rate(Some(1024 * 1024)), "1.00MB/s");
+        assert_eq!(format_rate(Some(512)), "0.5KB/s");
+        assert_eq!(format_rate(Some(0)), "0.0KB/s");
+        // `--` distinguishes "no activity yet" from a real 0.0KB/s
+        // stall; the renderer relies on this.
+        assert_eq!(format_rate(None), "--");
+    }
+
+    #[test]
+    fn lifetime_rate_floors_divisor_at_one_second_and_is_none_when_empty() {
+        assert_eq!(
+            lifetime_rate(2_000_000, Duration::from_millis(0)),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            lifetime_rate(2_000_000, Duration::from_secs(2)),
+            Some(1_000_000)
+        );
+        assert_eq!(lifetime_rate(0, Duration::from_secs(60)), None);
+    }
+
+    /// Bytes total must reflect in-flight transfers (via `FileProgress`
+    /// deltas), not jump only when a file finishes — the header
+    /// would otherwise sit at zero for the whole life of a long
+    /// single-file copy.
+    #[test]
+    fn overall_bytes_updates_live_from_file_progress_deltas() {
+        let mut state = State::new();
+        state.apply(CopyEvent::FileStarted {
+            id: 1,
+            table_key: "t".into(),
+            name: "a.parquet".into(),
+            total_bytes: 1_000,
+        });
+        state.apply(CopyEvent::FileProgress {
+            id: 1,
+            copied_bytes: 300,
+        });
+        assert_eq!(state.overall_bytes_copied, 300);
+
+        state.apply(CopyEvent::FileProgress {
+            id: 1,
+            copied_bytes: 1_000,
+        });
+        assert_eq!(state.overall_bytes_copied, 1_000);
+
+        state.apply(CopyEvent::FileFinished { id: 1 });
+        // FileFinished must not double-count — the bytes were already
+        // captured by the FileProgress deltas above.
+        assert_eq!(state.overall_bytes_copied, 1_000);
     }
 
     #[test]

@@ -13,5 +13,6 @@
 pub mod copy;
 pub mod event;
 pub mod reporter;
+pub mod speed;
 
 pub use reporter::Reporter;
