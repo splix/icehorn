@@ -22,3 +22,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = "1"
 ratatui = "0.30"
 tui-logger = { version = "0.18", default-features = false, features = ["tracing-support"] }
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["test-util"] }
