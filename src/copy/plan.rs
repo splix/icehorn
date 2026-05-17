@@ -20,14 +20,20 @@ use crate::sync_log;
 
 use super::paths::{filename_of, relative_under, strip_url_prefix};
 
-/// To-copy count below which we probe the destination per-file via
-/// HEAD instead of paginating the entire prefix with LIST. On a
-/// long-lived destination (hundreds of thousands of files) the full
-/// LIST dominates the table-prep time; for the typical incremental
-/// run (a handful of new files since last time), N HEADs in parallel
-/// finish in a fraction of a second. The threshold is roughly the
-/// page size of an S3 LIST so the request count stays in the same
-/// order of magnitude in either branch.
+/// Uncertain-residue count below which we probe the destination
+/// per-file via HEAD instead of paginating the entire prefix with
+/// LIST. "Uncertain" means *not in the sync log* — files we've
+/// already recorded copying are trusted as present without a
+/// round-trip, since `to_copy` for a long-lived table typically
+/// contains tens of thousands of carry-overs from prior snapshots
+/// of which only a handful are genuinely new.
+///
+/// On a long-lived destination (hundreds of thousands of files) the
+/// full LIST dominates the table-prep time; for the typical
+/// incremental run (a handful of new files since last time), N HEADs
+/// in parallel finish in a fraction of a second. The threshold is
+/// roughly the page size of an S3 LIST so the request count stays
+/// in the same order of magnitude in either branch.
 pub(super) const HEAD_PROBE_THRESHOLD: usize = 1000;
 
 /// What gets kept from the source's `snapshots[]` after intersecting
@@ -220,9 +226,53 @@ pub(super) async fn load_sync_log(
     }
 }
 
+/// Filter `candidates` down to paths we have no prior sync-log
+/// record of copying. The result is what we'd actually need to
+/// verify on the destination — the sync-log-known files are trusted
+/// as already-present and don't need a HEAD round-trip.
+pub(super) fn uncertain_paths(
+    candidates: &[String],
+    prev_sync: &HashMap<String, sync_log::Entry>,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|p| !prev_sync.contains_key(*p))
+        .cloned()
+        .collect()
+}
+
+/// Add a synthetic `existing` entry for every sync-log path the HEAD
+/// pass didn't cover, using the source size we recorded at copy
+/// time. This is the trick that lets the HEAD optimisation skip
+/// sync-log-known files entirely: when `should_skip` later compares
+/// the seeded size against the live `src_size`, an unchanged source
+/// matches and skips via the first arm, a changed source falls
+/// through to the etag-match arm and gets re-copied.
+///
+/// Trade-off: a file the user manually deleted from the destination
+/// stays "skipped" here. That's the price of avoiding the round-trip
+/// — the destination's ground truth is no longer checked for
+/// sync-log-known files when we take this path.
+pub(super) fn seed_existing_with_sync_log(
+    existing: &mut HashMap<String, u64>,
+    prev_sync: &HashMap<String, sync_log::Entry>,
+) {
+    for (rel, entry) in prev_sync {
+        existing
+            .entry(rel.clone())
+            .or_insert(entry.source_size as u64);
+    }
+}
+
 /// Decide whether a source file is already present at the destination.
-/// Two routes: same-size verbatim, or rewritten-but-source-unchanged
-/// (size+etag match the prior sync log). Anything else is a copy.
+///
+/// When the sync log has an entry for this path, that's the precise
+/// signal — it checks both size *and* etag, so it catches same-size
+/// content changes (and lets the HEAD-optimised path seed `existing`
+/// with a placeholder size without false-positive skips on etag
+/// mismatch). When no sync-log entry exists (first run, lost log,
+/// pre-sync-log copies), we fall back to size-only matching against
+/// whatever `existing` reports.
 pub(super) fn should_skip(
     existing: &HashMap<String, u64>,
     prev_sync: &HashMap<String, sync_log::Entry>,
@@ -230,16 +280,124 @@ pub(super) fn should_skip(
     src_size: u64,
     src_etag: Option<&str>,
 ) -> bool {
+    if let Some(entry) = prev_sync.get(relative) {
+        return existing.contains_key(relative) && entry.matches_source(src_size, src_etag);
+    }
     if let Some(&dst_size) = existing.get(relative)
         && dst_size == src_size
     {
         return true;
     }
-    if existing.contains_key(relative)
-        && let Some(entry) = prev_sync.get(relative)
-        && entry.matches_source(src_size, src_etag)
-    {
-        return true;
-    }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(rel: &str, source_size: i64, etag: Option<&str>) -> sync_log::Entry {
+        sync_log::Entry {
+            relative_path: rel.to_string(),
+            source_size,
+            source_etag: etag.map(String::from),
+            file_type: "parquet".to_string(),
+            rewritten: false,
+        }
+    }
+
+    /// The point of this filter: a 100k-file table where 99980 are
+    /// carry-overs from prior runs shouldn't push us into the full
+    /// LIST path — the residue is what determines the right strategy.
+    #[test]
+    fn uncertain_paths_keeps_only_files_missing_from_sync_log() {
+        let candidates = vec![
+            "data/a.parquet".to_string(),
+            "data/b.parquet".to_string(),
+            "data/c.parquet".to_string(),
+        ];
+        let mut sync = HashMap::new();
+        sync.insert("data/a.parquet".to_string(), entry("data/a.parquet", 10, None));
+        sync.insert("data/c.parquet".to_string(), entry("data/c.parquet", 30, None));
+
+        let residue = uncertain_paths(&candidates, &sync);
+        assert_eq!(residue, vec!["data/b.parquet".to_string()]);
+    }
+
+    #[test]
+    fn uncertain_paths_returns_everything_when_sync_log_empty() {
+        let candidates = vec!["x".to_string(), "y".to_string()];
+        let residue = uncertain_paths(&candidates, &HashMap::new());
+        assert_eq!(residue, candidates);
+    }
+
+    /// Seeded entries let `should_skip` recognise sync-log-known
+    /// files even though we didn't HEAD them: an unchanged source
+    /// matches the seeded size and skips via the first arm.
+    #[test]
+    fn seeded_sync_log_entries_make_should_skip_recognise_unchanged_source() {
+        let mut sync = HashMap::new();
+        sync.insert("a".to_string(), entry("a", 100, Some("etag-a")));
+        let mut existing = HashMap::new();
+        seed_existing_with_sync_log(&mut existing, &sync);
+
+        assert!(should_skip(&existing, &sync, "a", 100, Some("etag-a")));
+    }
+
+    /// And when the source changed (different size or etag), the
+    /// seeded entry must NOT cause a false skip — copy should still
+    /// be attempted.
+    #[test]
+    fn seeded_sync_log_does_not_skip_when_source_changed() {
+        let mut sync = HashMap::new();
+        sync.insert("a".to_string(), entry("a", 100, Some("etag-old")));
+        let mut existing = HashMap::new();
+        seed_existing_with_sync_log(&mut existing, &sync);
+
+        // Different size — should not skip.
+        assert!(!should_skip(&existing, &sync, "a", 200, Some("etag-old")));
+        // Same size, different etag — should not skip either.
+        assert!(!should_skip(&existing, &sync, "a", 100, Some("etag-new")));
+    }
+
+    /// HEAD results take priority over the seeded sync-log fallback
+    /// — they're ground truth, the sync log is a best guess.
+    #[test]
+    fn seeding_does_not_overwrite_existing_head_results() {
+        let mut sync = HashMap::new();
+        sync.insert("a".to_string(), entry("a", 100, None));
+        let mut existing = HashMap::new();
+        // Pretend HEAD returned a different size (e.g. dst was
+        // modified externally since the sync log was written).
+        existing.insert("a".to_string(), 999);
+
+        seed_existing_with_sync_log(&mut existing, &sync);
+        assert_eq!(existing.get("a"), Some(&999));
+    }
+
+    /// Sync log presence must take priority over the size-only
+    /// match: a file whose source size happens to equal what's on
+    /// dst, but whose etag has shifted, must not be skipped. The
+    /// old logic (first arm = size match, second arm = sync log)
+    /// would false-positive here.
+    #[test]
+    fn sync_log_check_overrides_coincidental_size_match() {
+        let mut sync = HashMap::new();
+        sync.insert("a".to_string(), entry("a", 100, Some("etag-old")));
+        let mut existing = HashMap::new();
+        existing.insert("a".to_string(), 100);
+
+        // src is 100 bytes (matches existing[a]) but etag changed,
+        // so the content is different — we must copy.
+        assert!(!should_skip(&existing, &sync, "a", 100, Some("etag-new")));
+    }
+
+    /// Falling back to size match when no sync-log entry exists keeps
+    /// behaviour for pre-sync-log copies and runs whose log was lost.
+    #[test]
+    fn size_only_fallback_when_no_sync_log_entry() {
+        let existing: HashMap<String, u64> = [("a".to_string(), 100)].into_iter().collect();
+        let sync: HashMap<String, sync_log::Entry> = HashMap::new();
+        assert!(should_skip(&existing, &sync, "a", 100, None));
+        assert!(!should_skip(&existing, &sync, "a", 200, None));
+    }
 }

@@ -37,7 +37,7 @@ use super::file;
 use super::paths::{relative_under, strip_url_prefix};
 use super::plan::{
     CopyPlan, HEAD_PROBE_THRESHOLD, build_plan, head_existing, list_dst_metadata_filenames,
-    list_existing, load_sync_log, pick_metadata,
+    list_existing, load_sync_log, pick_metadata, seed_existing_with_sync_log, uncertain_paths,
 };
 use super::progress::{ScanProgress, TableProgress};
 use super::transfer::{
@@ -172,7 +172,9 @@ impl TableCopy {
         // but the destination already holds hundreds of thousands.
         let (tree, prev_sync) = self.walk_and_load_sync(&plan).await?;
         let prepared = self.prepare_filtered_copy(loaded, plan, tree)?;
-        let existing = self.scan_dst_for_paths(&prepared.to_copy).await?;
+        let existing = self
+            .scan_dst_for_paths(&prepared.to_copy, &prev_sync)
+            .await?;
         let scanned = DestinationScan { existing, prev_sync };
 
         let (sync_tx, sync_writer) =
@@ -263,26 +265,48 @@ impl TableCopy {
     }
 
     /// Decide how to probe the destination for files in `to_copy`.
-    /// Below [`HEAD_PROBE_THRESHOLD`] we HEAD each candidate in
-    /// parallel — much faster than paginating the entire dst prefix
-    /// when only a handful of files are new but the destination already
-    /// holds hundreds of thousands of unrelated objects. Above the
-    /// threshold we fall back to a full LIST whose per-request
-    /// amortised cost beats N individual HEADs.
-    async fn scan_dst_for_paths(&self, to_copy: &[String]) -> Result<Arc<HashMap<String, u64>>> {
-        if to_copy.len() <= HEAD_PROBE_THRESHOLD {
+    /// The threshold compares against the *uncertain* count — files
+    /// we have no sync-log record of — not `to_copy.len()`, because
+    /// for a long-lived table almost everything in `to_copy` is a
+    /// carry-over from prior runs and would needlessly push us into
+    /// the full-LIST branch every time. Sync-log-known files are
+    /// trusted as present and seeded into `existing` so `should_skip`
+    /// can still reason about them.
+    ///
+    /// Below [`HEAD_PROBE_THRESHOLD`] uncertain files we HEAD each
+    /// in parallel — much faster than paginating the entire dst
+    /// prefix when only a handful of files are new but the destination
+    /// already holds hundreds of thousands of unrelated objects.
+    /// Above the threshold we fall back to a full LIST whose
+    /// per-request amortised cost beats N individual HEADs and whose
+    /// ground truth makes the sync-log seeding unnecessary.
+    async fn scan_dst_for_paths(
+        &self,
+        to_copy: &[String],
+        prev_sync: &HashMap<String, sync_log::Entry>,
+    ) -> Result<Arc<HashMap<String, u64>>> {
+        let uncertain = uncertain_paths(to_copy, prev_sync);
+
+        if uncertain.len() <= HEAD_PROBE_THRESHOLD {
             self.reporter.table_status(
                 &self.table_key,
-                format!("checking {} files on destination", to_copy.len()),
+                format!(
+                    "checking {} files on destination ({} trusted via sync log)",
+                    uncertain.len(),
+                    to_copy.len() - uncertain.len(),
+                ),
             );
-            head_existing(
+            let head_map = head_existing(
                 Arc::clone(&self.dst_store),
                 &self.dst_prefix,
-                to_copy,
+                &uncertain,
                 self.parallelism,
             )
             .await
-            .context("HEAD-probing destination")
+            .context("HEAD-probing destination")?;
+            let mut combined: HashMap<String, u64> = (*head_map).clone();
+            seed_existing_with_sync_log(&mut combined, prev_sync);
+            Ok(Arc::new(combined))
         } else {
             self.reporter
                 .table_status(&self.table_key, "scanning destination (full list)");
