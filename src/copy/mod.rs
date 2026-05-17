@@ -34,7 +34,11 @@ use crate::ui::Reporter;
 
 use table::{TableCopy, TableStats};
 
-pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
+pub async fn run(
+    args: CopyArgs,
+    reporter: Reporter,
+    shutdown: shutdown::Shutdown,
+) -> Result<()> {
     let src_config = S3Config::from_file(&args.from_config)?;
     let dst_config = S3Config::from_file(&args.to_config)?;
 
@@ -57,7 +61,17 @@ pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
 
     tracing::info!(namespace = %args.from, "discovering tables");
     reporter.global_status("discovering tables");
-    let mut tables = discover_tables(&*src_store, &src.prefix).await?;
+    // Wrap the first S3 call in a select with shutdown so the user can
+    // bail during the namespace LIST. Without this, Ctrl+C felt dead
+    // for the first few seconds of every run because nothing was yet
+    // awaiting `signalled()`.
+    let mut tables = tokio::select! {
+        biased;
+        _ = shutdown.signalled() => {
+            return Err(anyhow!("interrupted during table discovery"));
+        }
+        result = discover_tables(&*src_store, &src.prefix) => result?,
+    };
     if let Some(filter) = &args.table {
         let before = tables.len();
         tables.retain(|t| t == filter);
@@ -84,8 +98,6 @@ pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
         copy_parallel = args.copy_parallel,
         "starting namespace copy"
     );
-
-    let shutdown = shutdown::Shutdown::new().context("registering shutdown signals")?;
 
     let namespace_label = src
         .prefix

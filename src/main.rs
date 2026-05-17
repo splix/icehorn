@@ -7,7 +7,7 @@ mod show;
 mod sync_log;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command};
 use tracing_subscriber::layer::SubscriberExt;
@@ -26,7 +26,8 @@ async fn main() -> Result<()> {
         Command::Copy(args) => {
             init_plain_logging();
             log_levels_enabled();
-            copy::run(args, ui::Reporter::plain()).await
+            let shutdown = shutdown::Shutdown::new().context("registering shutdown signals")?;
+            copy::run(args, ui::Reporter::plain(), shutdown).await
         }
         Command::Show { command } => {
             init_plain_logging();
@@ -61,11 +62,19 @@ fn log_levels_enabled() {
 async fn run_copy_with_tui(args: cli::CopyArgs) -> Result<()> {
     init_tui_logger()?;
 
+    // One shutdown source shared between the OS-signal handler, the
+    // copy code (which awaits `signalled()` to abort cleanly) and the
+    // TUI (which translates a Ctrl+C key event into `.signal()` —
+    // crossterm's raw mode swallows the real SIGINT, so the TUI is
+    // the only place we can catch it while the UI is up).
+    let shutdown = shutdown::Shutdown::new().context("registering shutdown signals")?;
+
     let (reporter, rx) = ui::Reporter::channel();
-    let ui_handle = tokio::task::spawn_blocking(move || ui::copy::run(rx));
+    let ui_shutdown = shutdown.clone();
+    let ui_handle = tokio::task::spawn_blocking(move || ui::copy::run(rx, ui_shutdown));
 
     let copy_reporter = reporter.clone();
-    let copy_result = copy::run(args, copy_reporter).await;
+    let copy_result = copy::run(args, copy_reporter, shutdown).await;
     reporter.done();
 
     // Wait for the renderer to drain remaining events and exit cleanly

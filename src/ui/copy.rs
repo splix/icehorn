@@ -21,7 +21,7 @@ use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::QueueableCommand;
 use ratatui::crossterm::cursor::MoveToPreviousLine;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::terminal::{Clear, ClearType};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -60,11 +60,11 @@ const BAR_FILL: Color = Color::DarkGray;
 /// Slightly dimmer gray for status / hint text.
 const DIM: Color = Color::DarkGray;
 
-pub fn run(rx: mpsc::UnboundedReceiver<CopyEvent>) -> Result<()> {
+pub fn run(rx: mpsc::UnboundedReceiver<CopyEvent>, shutdown: shutdown::Shutdown) -> Result<()> {
     let mut terminal = ratatui::init_with_options(TerminalOptions {
         viewport: Viewport::Inline(VIEWPORT_HEIGHT),
     });
-    let result = main_loop(&mut terminal, rx);
+    let result = main_loop(&mut terminal, rx, &shutdown);
 
     // Reclaim the inline-viewport rows before tearing down raw mode.
     // ratatui's inline viewport doesn't clean itself up on drop — the
@@ -102,6 +102,7 @@ fn clear_viewport_region() -> io::Result<()> {
 fn main_loop(
     terminal: &mut DefaultTerminal,
     mut rx: mpsc::UnboundedReceiver<CopyEvent>,
+    shutdown: &shutdown::Shutdown,
 ) -> Result<State> {
     let mut state = State::new();
     let tick = Duration::from_millis(100);
@@ -135,16 +136,27 @@ fn main_loop(
             return Ok(state);
         }
 
-        // Allow Ctrl+C / q to drop the UI early. The copy keeps running
-        // — we only let go of the screen.
+        // Quit keys (Ctrl+C, q, Esc) signal the shared shutdown so
+        // the copy task aborts in addition to the UI tearing down.
+        // Crossterm's raw mode swallows the real SIGINT — without
+        // this hand-off, Ctrl+C felt completely dead during the
+        // metadata-discovery phase of a run.
         if event::poll(tick)?
             && let Event::Key(k) = event::read()?
             && k.kind == KeyEventKind::Press
-            && matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
+            && is_quit_key(&k)
         {
+            shutdown.signal();
             return Ok(state);
         }
     }
+}
+
+fn is_quit_key(k: &ratatui::crossterm::event::KeyEvent) -> bool {
+    let ctrl_c =
+        matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL);
+    let q_or_esc = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc);
+    ctrl_c || q_or_esc
 }
 
 /// Render the final stats to stderr. We print to stderr (not stdout)
