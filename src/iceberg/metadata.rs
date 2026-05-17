@@ -68,10 +68,12 @@ impl MetadataFile {
     }
 }
 
-/// A fully loaded `<NNNNN>-<uuid>.metadata.json`: the file descriptor
-/// plus the parsed structure.
+/// A fully loaded `<NNNNN>-<uuid>.metadata.json`: the file descriptor,
+/// the byte count of the source file (kept for sync-log accounting in
+/// the copy path), and the parsed structure.
 pub struct LoadedMetadata {
     pub file: MetadataFile,
+    pub raw_size: usize,
     pub meta: Metadata,
 }
 
@@ -88,9 +90,57 @@ pub async fn load_latest(
         return Ok(None);
     };
     let raw = read_json(store, &file.path).await?;
+    let raw_size = raw.len();
     let meta: Metadata = serde_json::from_slice(&raw)
         .with_context(|| format!("parsing metadata.json {}", file.path))?;
-    Ok(Some(LoadedMetadata { file, meta }))
+    Ok(Some(LoadedMetadata { file, raw_size, meta }))
+}
+
+/// Find the metadata.json whose `current-snapshot-id` equals
+/// `snapshot_id`. Searches newest version first (so a "current"
+/// snapshot supplied by a REST catalog typically resolves in a single
+/// read) and falls back through older versions until match or
+/// exhaustion. Returns `Ok(None)` if no metadata file carries that
+/// snapshot as current.
+pub async fn find_by_snapshot_id(
+    store: &(impl ObjectStore + ?Sized),
+    table_prefix: &str,
+    snapshot_id: i64,
+) -> Result<Option<LoadedMetadata>> {
+    let metadata_prefix = ObjPath::from(format!("{table_prefix}/metadata"));
+    let mut stream = store.list(Some(&metadata_prefix));
+    let mut candidates: Vec<MetadataFile> = Vec::new();
+    while let Some(obj) = stream
+        .try_next()
+        .await
+        .context("listing metadata files")?
+    {
+        // Same early-stop heuristic as `find_latest`: metadata names
+        // begin with a digit, manifest UUIDs starting with letters sort
+        // after them so we can bail without scanning the whole prefix.
+        let filename = obj.location.as_ref().rsplit('/').next().unwrap_or("");
+        if !filename.starts_with(|c: char| c.is_ascii_digit()) {
+            break;
+        }
+        if let Some(m) = MetadataFile::parse(&obj.location) {
+            candidates.push(m);
+        }
+    }
+    candidates.sort_by(|a, b| b.version.cmp(&a.version));
+
+    for file in candidates {
+        let raw = read_json(store, &file.path).await?;
+        let raw_size = raw.len();
+        let meta: Metadata = serde_json::from_slice(&raw)
+            .with_context(|| format!("parsing metadata.json {}", file.path))?;
+        if meta.current_snapshot_id == Some(snapshot_id) {
+            return Ok(Some(LoadedMetadata {
+                file,
+                raw_size,
+                meta,
+            }));
+        }
+    }
     Ok(None)
 }
 
@@ -358,6 +408,61 @@ mod tests {
 
         let store = InMemory::new();
         assert!(load_latest(&store, "warehouse/missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn find_by_snapshot_id_picks_the_matching_metadata_file() {
+        use object_store::memory::InMemory;
+        use object_store::PutPayload;
+
+        let store = InMemory::new();
+        let table_prefix = "warehouse/tbl";
+
+        // Older metadata with snapshot 100 as current.
+        store
+            .put(
+                &ObjPath::from(format!(
+                    "{table_prefix}/metadata/00001-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.metadata.json"
+                )),
+                PutPayload::from_static(
+                    br#"{"format-version": 2, "current-snapshot-id": 100, "snapshots": []}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        // Newest metadata with snapshot 200 — would be returned by load_latest.
+        store
+            .put(
+                &ObjPath::from(format!(
+                    "{table_prefix}/metadata/00007-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.metadata.json"
+                )),
+                PutPayload::from_static(
+                    br#"{"format-version": 2, "current-snapshot-id": 200, "snapshots": []}"#,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let by_old = find_by_snapshot_id(&store, table_prefix, 100)
+            .await
+            .unwrap()
+            .expect("snapshot 100 should resolve to version 1");
+        assert_eq!(by_old.file.version, 1);
+        assert_eq!(by_old.meta.current_snapshot_id, Some(100));
+
+        let by_new = find_by_snapshot_id(&store, table_prefix, 200)
+            .await
+            .unwrap()
+            .expect("snapshot 200 should resolve to version 7");
+        assert_eq!(by_new.file.version, 7);
+
+        assert!(
+            find_by_snapshot_id(&store, table_prefix, 999)
+                .await
+                .unwrap()
+                .is_none(),
+            "unknown snapshot must return None"
+        );
     }
 
     #[tokio::test]

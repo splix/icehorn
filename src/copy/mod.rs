@@ -44,9 +44,31 @@ pub async fn run(args: CopyArgs, reporter: Reporter) -> Result<()> {
     let src_store: Arc<dyn ObjectStore> = Arc::new(src_config.build_store(&src.bucket)?);
     let dst_store: Arc<dyn ObjectStore> = Arc::new(dst_config.build_store(&dst.bucket)?);
 
+    // Snapshot ids are per-table; without `--table` we'd have to scan
+    // every table in the namespace just to find the one that owns the
+    // id — wasted work plus a confusing log story. Force the caller
+    // to be explicit.
+    if matches!(args.scope, crate::cli::Scope::Snapshot(_)) && args.table.is_none() {
+        return Err(anyhow!(
+            "--scope snapshot:<id> requires --table <uuid> — snapshot ids are per-table, \
+             so we need to know which table to look in"
+        ));
+    }
+
     tracing::info!(namespace = %args.from, "discovering tables");
     reporter.global_status("discovering tables");
-    let tables = discover_tables(&*src_store, &src.prefix).await?;
+    let mut tables = discover_tables(&*src_store, &src.prefix).await?;
+    if let Some(filter) = &args.table {
+        let before = tables.len();
+        tables.retain(|t| t == filter);
+        if tables.is_empty() {
+            return Err(anyhow!(
+                "--table {filter} not found under {} (namespace has {before} other table(s))",
+                args.from
+            ));
+        }
+        tracing::info!(table = %filter, "filtered to single table");
+    }
     reporter.clear_global_status();
     if tables.is_empty() {
         return Err(anyhow!(

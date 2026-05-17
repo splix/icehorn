@@ -26,7 +26,9 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::cli::Scope;
 use crate::iceberg::manifest::{self, ManifestTree, WalkEvent};
-use crate::iceberg::metadata::{MetadataFile, find_latest, read_json};
+use crate::iceberg::metadata::{
+    LoadedMetadata as IcebergLoaded, MetadataFile, find_by_snapshot_id, find_latest, read_json,
+};
 use crate::iceberg::model::Metadata;
 use crate::sync_log;
 use crate::ui::Reporter;
@@ -79,14 +81,25 @@ pub struct TableCopy {
     pub copy_gate: Arc<Semaphore>,
 }
 
+/// Which metadata.json a `run_filtered` invocation should pin to. The
+/// `Scope::All` variant doesn't enter this code path — it has its own
+/// `run_all` flow that doesn't consult metadata at all.
+#[derive(Debug, Clone, Copy)]
+enum FilteredPin {
+    Latest,
+    Version(u32),
+    Snapshot(i64),
+}
+
 impl TableCopy {
     pub async fn run(self) -> Result<TableStats> {
         self.reporter
             .table_started(&self.table_key, &self.namespace_label, &self.table_key);
         let result = match self.scope {
             Scope::All => self.run_all().await,
-            Scope::Latest => self.run_filtered(None).await,
-            Scope::Version(v) => self.run_filtered(Some(v)).await,
+            Scope::Latest => self.run_filtered(FilteredPin::Latest).await,
+            Scope::Version(v) => self.run_filtered(FilteredPin::Version(v)).await,
+            Scope::Snapshot(id) => self.run_filtered(FilteredPin::Snapshot(id)).await,
         };
         self.reporter.table_finished(&self.table_key);
         result
@@ -140,8 +153,8 @@ impl TableCopy {
     /// If the source `metadata/` is missing or unreadable, the table is
     /// soft-skipped with a warning and zero stats — the namespace copy
     /// keeps going for the rest.
-    async fn run_filtered(&self, version: Option<u32>) -> Result<TableStats> {
-        let Some(loaded) = self.load_metadata(version).await? else {
+    async fn run_filtered(&self, pin: FilteredPin) -> Result<TableStats> {
+        let Some(loaded) = self.load_metadata(pin).await? else {
             return Ok(TableStats::default());
         };
         let plan = build_plan(
@@ -289,39 +302,79 @@ impl TableCopy {
     /// case. IO errors against `metadata/` propagate as `Err` so the
     /// caller can mark this table as failed and let the namespace
     /// continue with siblings (next run retries this table).
-    async fn load_metadata(&self, version: Option<u32>) -> Result<Option<LoadedMetadata>> {
+    async fn load_metadata(&self, pin: FilteredPin) -> Result<Option<LoadedMetadata>> {
         self.reporter
             .table_status(&self.table_key, "loading metadata");
-        let metadata_prefix = ObjPath::from(format!("{}/metadata", self.src_prefix));
-        let latest = find_latest(&*self.src_store, &metadata_prefix)
-            .await
-            .with_context(|| format!("listing metadata/ for {}", self.src_prefix))?;
-        let latest = match latest {
-            Some(latest) => latest,
-            None => {
-                tracing::warn!(table = %self.src_prefix, "no metadata.json found — skipping");
-                return Ok(None);
-            }
+        let Some(iceberg) = self.resolve_metadata(pin).await? else {
+            return Ok(None);
         };
-        let chosen = pick_metadata(&*self.src_store, &metadata_prefix, version, &latest).await?;
         tracing::info!(
             table = %self.src_prefix,
-            version = chosen.version,
-            metadata = %chosen.path.filename().unwrap_or(""),
+            version = iceberg.file.version,
+            snapshot_id = ?iceberg.meta.current_snapshot_id,
+            metadata = %iceberg.file.path.filename().unwrap_or(""),
             "loading metadata"
         );
 
-        let raw = read_json(&*self.src_store, &chosen.path).await?;
-        let meta: Metadata = serde_json::from_slice(&raw)
-            .with_context(|| format!("parsing metadata.json {}", chosen.path))?;
         let dst_existing_meta =
             list_dst_metadata_filenames(&*self.dst_store, &self.dst_prefix).await?;
         Ok(Some(LoadedMetadata {
-            chosen,
-            raw_size: raw.len(),
-            meta,
+            chosen: iceberg.file,
+            raw_size: iceberg.raw_size,
+            meta: iceberg.meta,
             dst_existing_meta,
         }))
+    }
+
+    /// Dispatch to the right metadata-finder based on `pin`. Each
+    /// branch returns the parsed `<NNNNN>-<uuid>.metadata.json` we
+    /// want to use as the source snapshot.
+    async fn resolve_metadata(&self, pin: FilteredPin) -> Result<Option<IcebergLoaded>> {
+        match pin {
+            FilteredPin::Snapshot(id) => {
+                self.reporter
+                    .table_status(&self.table_key, format!("searching for snapshot {id}"));
+                let found = find_by_snapshot_id(&*self.src_store, &self.src_prefix, id)
+                    .await
+                    .with_context(|| {
+                        format!("searching for snapshot {id} in {}", self.src_prefix)
+                    })?;
+                if found.is_none() {
+                    tracing::warn!(
+                        table = %self.src_prefix,
+                        snapshot_id = id,
+                        "snapshot not found in any metadata.json — skipping"
+                    );
+                }
+                Ok(found)
+            }
+            FilteredPin::Latest | FilteredPin::Version(_) => {
+                let metadata_prefix = ObjPath::from(format!("{}/metadata", self.src_prefix));
+                let latest = find_latest(&*self.src_store, &metadata_prefix)
+                    .await
+                    .with_context(|| format!("listing metadata/ for {}", self.src_prefix))?;
+                let Some(latest) = latest else {
+                    tracing::warn!(table = %self.src_prefix, "no metadata.json found — skipping");
+                    return Ok(None);
+                };
+                let chosen = match pin {
+                    FilteredPin::Latest => latest,
+                    FilteredPin::Version(v) => {
+                        pick_metadata(&*self.src_store, &metadata_prefix, Some(v), &latest).await?
+                    }
+                    FilteredPin::Snapshot(_) => unreachable!("handled above"),
+                };
+                let raw = read_json(&*self.src_store, &chosen.path).await?;
+                let raw_size = raw.len();
+                let meta: Metadata = serde_json::from_slice(&raw)
+                    .with_context(|| format!("parsing metadata.json {}", chosen.path))?;
+                Ok(Some(IcebergLoaded {
+                    file: chosen,
+                    raw_size,
+                    meta,
+                }))
+            }
+        }
     }
 
     /// Filter the in-memory `Metadata` to match the kept set, build the

@@ -46,6 +46,13 @@ pub struct CopyArgs {
     #[arg(long)]
     pub to: String,
 
+    /// If set, copy only this specific table UUID within the
+    /// namespace pointed to by `--from`. Required when `--scope
+    /// snapshot:<id>` is used (snapshot ids are per-table). Without
+    /// this flag, every table under `--from` is copied.
+    #[arg(long = "table")]
+    pub table: Option<String>,
+
     /// What to copy:
     ///   `latest` (default) — only files reachable from each table's
     ///                        current snapshot, plus snapshots whose
@@ -54,6 +61,11 @@ pub struct CopyArgs {
     ///   `all`              — every file under the source prefix
     ///   `<NNNNN>`          — files reachable from a specific metadata
     ///                        version (e.g. `5` or `00005`)
+    ///   `snapshot:<ID>`    — files reachable from whichever metadata
+    ///                        file carries `<ID>` as its current
+    ///                        snapshot — handy when a catalog
+    ///                        (Lakekeeper, Polaris, …) hands you a
+    ///                        snapshot id but not the metadata version
     #[arg(long, default_value = "latest", value_parser = Scope::parse)]
     pub scope: Scope,
 
@@ -77,17 +89,28 @@ pub enum Scope {
     Latest,
     All,
     Version(u32),
+    /// Resolve the metadata file by its current snapshot id — useful
+    /// when the source is managed by a REST catalog that hands you a
+    /// snapshot id rather than a metadata file path.
+    Snapshot(i64),
 }
 
 impl Scope {
     fn parse(s: &str) -> Result<Self, String> {
+        if let Some(rest) = s.strip_prefix("snapshot:") {
+            return rest
+                .parse::<i64>()
+                .map(Scope::Snapshot)
+                .map_err(|_| format!("expected 'snapshot:<int64-id>'; got '{s}'"));
+        }
         match s {
             "latest" => Ok(Scope::Latest),
             "all" => Ok(Scope::All),
-            other => other
-                .parse::<u32>()
-                .map(Scope::Version)
-                .map_err(|_| format!("expected 'latest', 'all', or a metadata version number; got '{other}'")),
+            other => other.parse::<u32>().map(Scope::Version).map_err(|_| {
+                format!(
+                    "expected 'latest', 'all', a metadata version number, or 'snapshot:<id>'; got '{other}'"
+                )
+            }),
         }
     }
 }
@@ -161,5 +184,21 @@ mod tests {
     fn scope_rejects_garbage() {
         assert!(Scope::parse("nope").is_err());
         assert!(Scope::parse("").is_err());
+    }
+
+    #[test]
+    fn scope_parses_snapshot_id() {
+        assert!(matches!(
+            Scope::parse("snapshot:5847308092535477582").unwrap(),
+            Scope::Snapshot(5847308092535477582)
+        ));
+        // Negative ids are accepted (the spec doesn't forbid them); only
+        // non-numeric tails are rejected.
+        assert!(matches!(
+            Scope::parse("snapshot:-12345").unwrap(),
+            Scope::Snapshot(-12345)
+        ));
+        assert!(Scope::parse("snapshot:not-a-number").is_err());
+        assert!(Scope::parse("snapshot:").is_err());
     }
 }
