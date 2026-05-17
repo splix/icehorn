@@ -26,7 +26,7 @@ use ratatui::crossterm::terminal::{Clear, ClearType};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Gauge, Paragraph};
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::{TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 use tui_logger::{TuiLoggerLevelOutput, TuiLoggerWidget};
@@ -34,9 +34,10 @@ use tui_logger::{TuiLoggerLevelOutput, TuiLoggerWidget};
 use super::event::CopyEvent;
 use super::speed::SpeedTracker;
 
-/// Lines reserved for log output. Fits the recent useful chatter
-/// without dominating the view.
-const LOG_LINES: u16 = 6;
+/// Total rows reserved for the log panel — six rows of content plus
+/// one row each for the top and bottom rule that separates the panel
+/// from the header above and the per-table grid below.
+const LOG_LINES: u16 = 6 + 2;
 /// Per-table summary rows. Caps at the default `--tables.parallel`
 /// value (4) since that's how many tables are actively copying at
 /// once; tables waiting in the discovery phase still show in this list.
@@ -50,10 +51,12 @@ const MAX_FILE_ROWS: u16 = 5;
 /// scrollback.
 const VIEWPORT_HEIGHT: u16 = 1 + 1 + LOG_LINES + MAX_TABLE_ROWS + MAX_FILE_ROWS;
 
-/// Single accent used for both progress bar fills. Grayscale on purpose
-/// — the bars convey position, not severity, so they shouldn't compete
-/// with the actually-meaningful colors of WARN / ERROR log lines.
-const BAR_FILL: Color = Color::Gray;
+/// Single accent used for both progress bar fills. Deliberately one
+/// step darker than the surrounding text (`Color::Gray`) so the bar
+/// reads as a background fill rather than as foreground content —
+/// keeps it from competing with the actually-meaningful colors of
+/// WARN / ERROR log lines.
+const BAR_FILL: Color = Color::DarkGray;
 /// Slightly dimmer gray for status / hint text.
 const DIM: Color = Color::DarkGray;
 
@@ -445,22 +448,30 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &State) {
 /// Render the log pane via [`TuiLoggerWidget`]. Tracing events arrive
 /// through the `tui_logger` crate's own subscriber layer — see
 /// `init_tui_logger` in `main.rs` — and the widget tails them.
+///
+/// The panel sits between the per-table summary above and the file
+/// progress bars below; thin top + bottom rules give the eye a clear
+/// boundary so the log lines don't blur into the surrounding rows.
 fn draw_logs(frame: &mut ratatui::Frame, area: Rect) {
     if area.height == 0 {
         return;
     }
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::new().fg(DIM));
     let widget = TuiLoggerWidget::default()
+        .block(block)
         .output_separator(' ')
         .output_timestamp(None)
         .output_level(Some(TuiLoggerLevelOutput::Abbreviated))
         .output_target(false)
         .output_file(false)
         .output_line(false)
-        // Semantic colors for severity stay; INFO/DEBUG/TRACE go gray
-        // so they don't shout for attention.
+        // Semantic colors stay for WARN / ERROR; INFO/DEBUG/TRACE all
+        // drop to dim gray so the panel reads as background context.
         .style_error(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
         .style_warn(Style::new().fg(Color::Yellow))
-        .style_info(Style::new().fg(Color::Gray))
+        .style_info(Style::new().fg(DIM))
         .style_debug(Style::new().fg(DIM))
         .style_trace(Style::new().fg(DIM));
     frame.render_widget(widget, area);
@@ -480,7 +491,19 @@ fn draw_files(frame: &mut ratatui::Frame, area: Rect, state: &State) {
         .split(area);
 
     if state.files.is_empty() {
-        let line = Line::from(Span::styled("(no files in flight)", Style::new().fg(DIM)));
+        // The empty file list almost always means we're still in the
+        // discovery phase (listing source, walking manifests, scanning
+        // dst). A spinner makes it obvious the program is alive — the
+        // old static "(no files in flight)" looked like a hang during
+        // the minute-long discovery on large tables.
+        let spinner = spinner_frame(state.started_at.elapsed());
+        let line = Line::from(vec![
+            Span::styled(format!("{spinner} "), Style::new().fg(DIM)),
+            Span::styled(
+                "preparing the files list",
+                Style::new().fg(DIM).add_modifier(Modifier::ITALIC),
+            ),
+        ]);
         frame.render_widget(Paragraph::new(line), rows[0]);
         return;
     }
@@ -698,6 +721,16 @@ fn lifetime_rate(bytes: u64, elapsed: Duration) -> Option<u64> {
     Some(bytes / secs)
 }
 
+/// One frame of a braille-dot spinner, advancing every 100 ms — the
+/// renderer's draw tick. Driven by elapsed wall time rather than a
+/// frame counter so a pause in redraws doesn't leave the spinner
+/// stuck on the same glyph.
+fn spinner_frame(elapsed: Duration) -> char {
+    const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let idx = (elapsed.as_millis() / 100) as usize % FRAMES.len();
+    FRAMES[idx]
+}
+
 fn truncate(s: &str, max: usize) -> String {
     // Iceberg filenames are usually `<UUID>-mNN.avro` or long-hash
     // parquet files — the tail carries no extra signal once truncated,
@@ -745,6 +778,17 @@ mod tests {
             Some(1_000_000)
         );
         assert_eq!(lifetime_rate(0, Duration::from_secs(60)), None);
+    }
+
+    /// The spinner must advance over time and wrap cleanly — a
+    /// stuck-glyph regression would look like a hung process.
+    #[test]
+    fn spinner_advances_and_wraps() {
+        let f0 = spinner_frame(Duration::from_millis(0));
+        let f1 = spinner_frame(Duration::from_millis(100));
+        assert_ne!(f0, f1, "spinner must change between adjacent 100ms ticks");
+        // 10 frames * 100ms = one full cycle.
+        assert_eq!(f0, spinner_frame(Duration::from_millis(1000)));
     }
 
     /// Bytes total must reflect in-flight transfers (via `FileProgress`
