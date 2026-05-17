@@ -35,12 +35,17 @@ impl MetadataFile {
     /// before the JSON extension). Instead we require a valid UUID directly
     /// after the version, then check that the remainder looks like a
     /// metadata extension — that locks out manifests, puffin files, etc.
+    ///
+    /// The version width isn't fixed: writers zero-pad to 5 digits while
+    /// the counter fits in 5 digits, then expand (so version 100000 is
+    /// emitted as `100000-…`, not `00000-…`). We accept any all-digit
+    /// prefix; the UUID and `.metadata.json` checks below keep us from
+    /// confusing manifest filenames (which start with hex UUIDs that may
+    /// happen to be all-digit) for metadata.
     pub fn parse(path: &ObjPath) -> Option<Self> {
         let filename = path.as_ref().rsplit('/').next()?;
         let (version_str, rest) = filename.split_once('-')?;
-        // Version is always zero-padded to 5 digits — reject anything else
-        // so we don't confuse unrelated filenames with metadata.
-        if version_str.len() != 5 {
+        if version_str.is_empty() || !version_str.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
         let version: u32 = version_str.parse().ok()?;
@@ -86,6 +91,7 @@ pub async fn load_latest(
     let meta: Metadata = serde_json::from_slice(&raw)
         .with_context(|| format!("parsing metadata.json {}", file.path))?;
     Ok(Some(LoadedMetadata { file, meta }))
+    Ok(None)
 }
 
 pub async fn find_latest(
@@ -177,6 +183,33 @@ mod tests {
         assert_eq!(
             m.uuid,
             Uuid::parse_str("019d9daf-e720-7131-ba9a-b771f5c2b2f1").unwrap()
+        );
+    }
+
+    #[test]
+    fn parses_metadata_name_with_six_digit_version() {
+        // Iceberg writers expand the zero-pad once the counter passes
+        // 99999. A long-lived table can easily reach 6+ digits — and
+        // the old strict 5-digit rule silently dropped these.
+        let m = MetadataFile::parse(&ObjPath::from(
+            "metadata/110812-019db282-45b0-7df2-bd54-24d7388d5d80.gz.metadata.json",
+        ))
+        .unwrap();
+        assert_eq!(m.version, 110812);
+    }
+
+    #[test]
+    fn rejects_manifest_with_all_digit_uuid_prefix() {
+        // A statistically improbable but possible edge case: a manifest
+        // file whose 8-char UUID head happens to be all digits. The
+        // relaxed version check would naively accept the head as a
+        // version, but the UUID-format and `.metadata.json` checks
+        // catch it.
+        assert!(
+            MetadataFile::parse(&ObjPath::from(
+                "metadata/12345678-9012-3456-7890-123456789012-m0.avro",
+            ))
+            .is_none()
         );
     }
 
