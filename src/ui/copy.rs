@@ -14,11 +14,15 @@
 //! warnings and errors still stand out.
 
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::QueueableCommand;
+use ratatui::crossterm::cursor::MoveToPreviousLine;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::terminal::{Clear, ClearType};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -58,15 +62,35 @@ pub fn run(rx: mpsc::UnboundedReceiver<CopyEvent>) -> Result<()> {
         viewport: Viewport::Inline(VIEWPORT_HEIGHT),
     });
     let result = main_loop(&mut terminal, rx);
+
+    // Reclaim the inline-viewport rows before tearing down raw mode.
+    // ratatui's inline viewport doesn't clean itself up on drop — the
+    // last frame stays frozen in the terminal, and any summary
+    // printed afterwards lands beneath that ghost frame, which is the
+    // "messy interleaved output" users see at the end of a run.
+    let _ = clear_viewport_region();
     ratatui::restore();
 
-    // After restore the inline viewport is gone, so any rich state we
-    // showed is too. Print a permanent summary into the scrollback so
-    // users who weren't watching the live view still see what happened.
     if let Ok(state) = &result {
         print_summary(state);
     }
     result.map(|_| ())
+}
+
+/// Walk the cursor back to the top of the inline viewport region and
+/// wipe everything from there to the end of the screen. After the
+/// last `terminal.draw`, ratatui leaves the cursor at the line just
+/// below the viewport, so `MoveToPreviousLine(VIEWPORT_HEIGHT)` lands
+/// us exactly at the first row the viewport occupied.
+///
+/// Errors are intentionally swallowed by the caller — failing to
+/// pretty-clean the terminal shouldn't fail the whole run, the worst
+/// case is the user sees the same stale-frame mess we get today.
+fn clear_viewport_region() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    stdout.queue(MoveToPreviousLine(VIEWPORT_HEIGHT))?;
+    stdout.queue(Clear(ClearType::FromCursorDown))?;
+    stdout.flush()
 }
 
 /// Drive the draw loop. We poll the event channel (non-blocking) and
@@ -146,11 +170,12 @@ fn print_summary(state: &State) {
     );
     eprintln!("  Bytes   : {bytes_str} transferred ({})", format_rate(avg_rate));
 
-    // Per-table breakdown when there's more than one — single-table
-    // runs would just duplicate the totals above.
-    if state.tables.len() > 1 {
+    // Always list the tables — the user explicitly wants to see which
+    // ones participated, not just the count. UUIDs aren't pretty but
+    // they're what we have at this layer.
+    if !state.tables.is_empty() {
         eprintln!();
-        eprintln!("Per-table:");
+        eprintln!("Tables:");
         let mut tables: Vec<&TableState> = state.tables.values().collect();
         tables.sort_by(|a, b| a.table.cmp(&b.table));
         for t in &tables {
